@@ -1,0 +1,16 @@
+node_modules/
+dist/
+_kaifa/
+*.log
+target/
+src-tauri/gen/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.pem
+*.key
+*.pfx
+*.p12
