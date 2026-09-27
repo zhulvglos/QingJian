@@ -6,7 +6,7 @@ Windows 桌面便签与笔记工具，提供外侧快捷标签、提醒、资讯
 
 ## 下载安装
 
-1. 打开 [0.10.3 发布页](https://github.com/zhulvglos/QingJian/releases/tag/v0.10.3)，下载 Assets 中的 `轻笺 V1_0.10.3_x64-setup.exe`。
+1. 打开 [0.10.3 发布页](https://github.com/zhulvglos/QingJian/releases/tag/v0.10.3)，下载 Assets 中的 `V1_0.10.3_x64-setup.exe`。
 2. 普通用户无需下载 Source code，无需安装 Git、Node.js、Rust 或 Python。
 3. 升级前保存草稿、结束录音，从托盘退出旧程序；重要笔记先通过“设置 → 文件”导出。
 4. 运行安装包，选择安装位置，再启动“轻笺 V1”。应用需要 Microsoft Edge WebView2 Runtime；缺少此组件的干净系统尚未实测，请留意安装向导的依赖提示。
