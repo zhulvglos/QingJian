@@ -3,6 +3,7 @@ import { emitTo } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { RichBodyEditor, ReadOnlyBody } from './rich_document';
 import { CalendarPicker } from './calendar_picker';
+import {useRunState} from './run_session';
 
 export type ItemKind = 'sticky' | 'note';
 export type Item = { id: string; kind: ItemKind; title: string; body: string; bodyJson: string | null; createdAt: string; updatedAt: string; revision: number; isPinned: boolean; sortOrder: number };
@@ -43,8 +44,8 @@ export function ItemWorkspace({ kind, view, items, trashed, reminders, draft, ed
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const gestureRef = useRef<{ id: string; x: number; y: number; lastX: number; swiping: boolean } | null>(null);
   const suppressClickRef = useRef(false);
-  const [split, setSplit] = useState(41);
-  const [heightSplit, setHeightSplit] = useState(63);
+  const [split, setSplit] = useRunState(kind+'.split',41);
+  const [heightSplit, setHeightSplit] = useRunState(kind+'.heightSplit',63);
   const [swipeOpen, setSwipeOpen] = useState<string | null>(null);
   const [contextItem, setContextItem] = useState<{ item: Item; x: number; y: number } | null>(null);
   const [toolsTarget, setToolsTarget] = useState<HTMLDivElement | null>(null);
@@ -52,7 +53,7 @@ export function ItemWorkspace({ kind, view, items, trashed, reminders, draft, ed
   const [reminderInput, setReminderInput] = useState('');
   const [reminderError, setReminderError] = useState('');
   const [reminderBusy, setReminderBusy] = useState(false);
-  const [readSelection, setReadSelection] = useState<{view: string; id: string} | null>(null);
+  const [readSelection, setReadSelection] = useRunState<{view: string; id: string} | null>(kind+'.'+view+'.readSelection',null);
   const readOnly = view === '待办' || view === '已完成';
   const activeReminder = reminders.find((entry) => entry.itemId === draft?.id && entry.isCurrent);
   const completedHistory = reminders.filter((entry) => entry.itemId === draft?.id && entry.status === 'completed');
@@ -70,7 +71,6 @@ export function ItemWorkspace({ kind, view, items, trashed, reminders, draft, ed
 
   // 只读选择独立于编辑草稿；刷新或完成提醒后，已消失的选择回退到第一条。
   const selectedSaved = entries.find(item => readSelection?.view === kind + view && item.id === readSelection.id) ?? entries[0];
-  useEffect(() => { setReadSelection(null); }, [kind, view]);
   const selectedId = readOnly ? selectedSaved?.id : draft?.id;
   const selectItem = (item: Item) => readOnly ? setReadSelection({view: kind + view, id: item.id}) : onSelect(item);
   const selectedReminder = reminders.find(entry => entry.itemId === selectedSaved?.id && entry.status === 'pending' && entry.isCurrent);

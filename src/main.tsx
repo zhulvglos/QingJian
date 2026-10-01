@@ -7,11 +7,13 @@ import { ItemWorkspace } from './item_workspace';
 import { NewsPanel } from './news_panel';
 import { WindowSettings } from './window_settings';
 import { FileSettings } from './file_settings';
+import {DocumentImportDialog} from './document_import';
 import { FreeApiPanel } from './free_api_panel';
 import {AudioPanel,type AudioGuard} from './audio_panel';
 import {QuickSearch} from './quick_search';
 import {VoiceSettings,OnlineSettings} from './model_settings';
 import {readDocument,documentText} from './rich_document';
+import {useRunScroll} from './run_session';
 import type { Draft, Item, ItemKind, ItemView, Reminder } from './item_workspace';
 import './style.css';
 const brandIcon = new URL('./assets/qingjian-brand.svg', import.meta.url).href;
@@ -21,6 +23,8 @@ type ThemeId = 'mint_morning' | 'new_leaf' | 'warm_apricot' | 'coral' | 'lilac_m
 type FontSize = 'small' | 'standard' | 'large';
 type LeaveAction = {type:'configure';tab:'语音'|'模型'|'录音'} | { type: 'transcript'; text:string; item?:Item } | { type: 'section'; section: Section } | { type: 'tab'; tab: string } | { type: 'item' | 'pin' | 'trash'; item: Item } | { type: 'new'; kind: ItemKind } | { type: 'hide' | 'quit' };
 type DeleteConfirm = { type: 'trash' | 'forever'; item: Item };
+type TaskInfo={kind:string;label:string;status:string;startedAt?:string;endedAt?:string;progress?:string;canCancel?:boolean};
+type TaskSnapshot={modelNews:TaskInfo;textTest:TaskInfo;formalOnline:TaskInfo;audio:TaskInfo;recording:boolean};
 
 const appWindow = getCurrentWindow();
 const resizeDirections = [
@@ -85,8 +89,18 @@ function EmptyState({ icon, title, detail }: { icon: string; title: string; deta
 }
 
 function App() {
+  const [maximized,setMaximized]=useState(false),[sizeChanging,setSizeChanging]=useState(false);
+  useEffect(()=>{
+    let live=true;const read=()=>void invoke<{maximized:boolean}>('get_shell_diagnostics').then(s=>{if(live)setMaximized(s.maximized);}).catch(()=>{});
+    // 图标依据真实原生窗口状态，包含系统快捷键、最小化恢复和跨屏尺寸变化。
+    read();const listener=appWindow.onResized(read);const timer=window.setInterval(read,800);
+    return()=>{live=false;clearInterval(timer);void listener.then(f=>f());};
+  },[]);
   const [section, setSection] = useState<Section>('news');
-  const [tab, setTab] = useState(defaultSubnav.news);
+  const [tabs,setTabs]=useState<Record<Section,string>>({...defaultSubnav});
+  const tab=tabs[section];
+  const setTab=(value:string)=>setTabs(previous=>({...previous,[section]:value}));
+  const navigate=(next:Section,value?:string)=>{setSection(next);if(value)setTabs(previous=>({...previous,[next]:value}));};
   const [theme, setTheme] = useState<ThemeId>(initialTheme);
   const [fontSize, setFontSize] = useState<FontSize>(initialFontSize);
   const [items, setItems] = useState<Record<ItemKind, Item[]>>({ sticky: [], note: [] });
@@ -98,9 +112,17 @@ function App() {
   const [dataError, setDataError] = useState('');
   const [saveError, setSaveError] = useState('');
   const [actionError, setActionError] = useState('');
+  const [tasks,setTasks]=useState<TaskSnapshot|null>(null);
   const [status, setStatus] = useState('');
   const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [importKind,setImportKind]=useState<ItemKind|null>(null),[importSaving,setImportSaving]=useState(false);
+  const [drafts,setDrafts]=useState<Record<ItemKind,Draft|null>>({sticky:null,note:null});
+  const kind=section==='stickies'?'sticky':section==='notes'?'note':null;
+  const draft=kind?drafts[kind]:null;
+  const setDraft:React.Dispatch<React.SetStateAction<Draft|null>>=next=>setDrafts(previous=>{
+    const value=typeof next==='function'?next(kind?previous[kind]:null):next;
+    return value?{...previous,[value.kind]:value}:kind?{...previous,[kind]:null}:previous;
+  });
   const [editorSession, setEditorSession] = useState(0);
   const [pending, setPending] = useState<LeaveAction | null>(null);
   const audioGuard=useRef<AudioGuard|null>(null);
@@ -109,6 +131,10 @@ function App() {
   const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirm | null>(null);
   const actionRef = useRef<(action: LeaveAction) => void>(() => {});
   const saveRef = useRef<(after?: LeaveAction) => Promise<void>>(async () => {});
+  const contentRef=useRef<HTMLDivElement>(null);
+  const capturePosition=useRunScroll(contentRef,section+'/'+tab);
+  const dirtyDraft=(d:Draft|null)=>!!d&&(d.title!==d.savedTitle||d.body!==d.savedBody||d.bodyJson!==d.savedBodyJson);
+  useEffect(()=>{let live=true;const poll=()=>void invoke<TaskSnapshot>('task_status').then(next=>{if(!live)return;setTasks(next);if(!next.recording&&next.audio.status!=='running'&&next.formalOnline.status!=='running')setActionError(old=>old.includes('正在进行')? '':old);}).catch(()=>{});poll();const timer=window.setInterval(poll,1000);return()=>{live=false;window.clearInterval(timer);};},[]);
 
   useEffect(() => {
     // 五套主题只改变语义色；暖杏是首次启动默认项。
@@ -139,6 +165,11 @@ function App() {
     finally { setLoading(false); }
   };
   useEffect(() => { void reload(); }, []);
+  useEffect(()=>{
+    if(loading)return;
+    // 删除或导入后安全回退；检查只随实际列表更新，不因编辑草稿自动提交或保存。
+    setDrafts(previous=>{let changed=false;const next={...previous};for(const k of ['sticky','note'] as const){const d=previous[k];if(d?.id&&!items[k].some(i=>i.id===d.id)){next[k]=null;changed=true;}}return changed?next:previous;});
+  },[items,loading]);
   useEffect(() => {
     if (!status) return;
     const timer = window.setTimeout(() => setStatus(''), 1800);
@@ -150,49 +181,55 @@ function App() {
     setBellOpen(false);
     if(action.type==='transcript'){
       // 追加前重新读取目标，保留其富文本；这里只生成草稿，仍由 Ctrl+S 落库。
-      try{const item=action.item?await invoke<Item>('get_item',{id:action.item.id}):undefined;const doc=readDocument(item?.body||'',item?.bodyJson);const extra=readDocument(action.text).document.content||[];doc.document.content=[...(item?doc.document.content||[]:[]),...extra];setSection('notes');setTab('+ 新建');setDraft({id:item?.id,kind:'note',title:item?.title||'会议记录',body:documentText(doc.document),bodyJson:JSON.stringify(doc),revision:item?.revision,updatedAt:item?.updatedAt,savedTitle:item?.title||'',savedBody:item?.body||'',savedBodyJson:item?.bodyJson||null});setEditorSession(n=>n+1);}catch(e){setActionError(String(e));}return;
+      try{const item=action.item?await invoke<Item>('get_item',{id:action.item.id}):undefined;const doc=readDocument(item?.body||'',item?.bodyJson);const extra=readDocument(action.text).document.content||[];doc.document.content=[...(item?doc.document.content||[]:[]),...extra];navigate('notes','+ 新建');setDraft({id:item?.id,kind:'note',title:item?.title||'会议记录',body:documentText(doc.document),bodyJson:JSON.stringify(doc),revision:item?.revision,updatedAt:item?.updatedAt,savedTitle:item?.title||'',savedBody:item?.body||'',savedBodyJson:item?.bodyJson||null});setEditorSession(n=>n+1);}catch(e){setActionError(String(e));}return;
     }
     if (action.type === 'hide' || action.type === 'quit') {
       try { await invoke('finish_leave', { action: action.type }); }
       catch (error) { setActionError(String(error)); }
       return;
     }
-    if(action.type==='configure'){setSection('settings');setTab(action.tab);setDraft(null);return;}
+    if(action.type==='configure'){navigate('settings',action.tab);return;}
     if (action.type === 'section') {
-      setSection(action.section); setTab(defaultSubnav[action.section]);
-      // 每次进入内容主页面都创建内存中的空白草稿，未输入时不会产生记录。
-      setDraft(action.section === 'stickies' || action.section === 'notes' ? { kind: action.section === 'stickies' ? 'sticky' : 'note', title: '', body: '', bodyJson: null, savedTitle: '', savedBody: '', savedBodyJson: null } : null);
-      setEditorSession((value) => value + 1);
+      navigate(action.section);
+      // 栏目首次进入沿用默认页；随后保留独立草稿，切页不自动保存或丢弃。
+      if(action.section==='stickies'||action.section==='notes'){const k=action.section==='stickies'?'sticky':'note';if(!drafts[k])setDraft({kind:k,title:'',body:'',bodyJson:null,savedTitle:'',savedBody:'',savedBodyJson:null});}
       return;
     }
     if (action.type === 'tab') {
       setTab(action.tab);
-      if (section === 'stickies' || section === 'notes') setDraft(action.tab === '+ 新建' ? { kind: section === 'stickies' ? 'sticky' : 'note', title: '', body: '', bodyJson: null, savedTitle: '', savedBody: '', savedBodyJson: null } : null);
-      setEditorSession((value) => value + 1);
       return;
     }
     if (action.type === 'trash') { setDeleteConfirm({ type: 'trash', item: action.item }); return; }
     if (action.type === 'item' || action.type === 'pin') {
       const item = action.item;
-      if (action.type === 'pin') { const next = item.kind === 'sticky' ? 'stickies' : 'notes'; setSection(next); setTab(defaultSubnav[next]); }
+      if (action.type === 'pin') { const next = item.kind === 'sticky' ? 'stickies' : 'notes'; navigate(next,defaultSubnav[next]); }
       setEditorSession((value) => value + 1);
       setDraft({ id: item.id, kind: item.kind, title: item.title, body: item.body, bodyJson: item.bodyJson, updatedAt: item.updatedAt, revision: item.revision, savedTitle: item.title, savedBody: item.body, savedBodyJson: item.bodyJson });
       return;
     }
     if (action.type === 'new') { setTab('+ 新建'); setEditorSession((value) => value + 1); setDraft({ kind: action.kind, title: '', body: '', bodyJson: null, savedTitle: '', savedBody: '', savedBodyJson: null }); return; }
   };
-  const isDirty = !!draft && (draft.title !== draft.savedTitle || draft.body !== draft.savedBody || draft.bodyJson !== draft.savedBodyJson);
+  const isDirty = dirtyDraft(draft);
+  const anyDirty=Object.values(drafts).some(dirtyDraft);
   useEffect(() => {
     // 编辑焦点、草稿与对话框保护贴边隐藏；鼠标拖动由 Windows 按键状态另行保护。
-    const update = () => { const focus=document.activeElement; const editing=focus instanceof HTMLElement&&(focus.isContentEditable||focus.matches('textarea,input:not([type="checkbox"]):not([type="radio"]),select')); const modal=!!document.querySelector('[role="dialog"],[data-native-dialog-busy="true"]'); void invoke('set_shell_busy',{busy:isDirty||!!pending||!!deleteConfirm||bellOpen||saving||editing||modal}).catch(()=>{}); };
+    const update = () => { const focus=document.activeElement; const editing=focus instanceof HTMLElement&&(focus.isContentEditable||focus.matches('textarea,input:not([type="checkbox"]):not([type="radio"]),select')); const modal=!!document.querySelector('[role="dialog"],[data-native-dialog-busy="true"]'); void invoke('set_shell_busy',{busy:anyDirty||!!pending||!!deleteConfirm||bellOpen||saving||editing||modal}).catch(()=>{}); };
     update();const timer=window.setInterval(update,250);return()=>window.clearInterval(timer);
-  },[isDirty,pending,deleteConfirm,bellOpen,saving]);
+  },[anyDirty,pending,deleteConfirm,bellOpen,saving]);
   const requestAction = (action: LeaveAction) => {
-    if (saving || pending || audioPending) return;
+    if (saving || importSaving || pending || audioPending) return;
     if(recording&&(action.type==='hide'||action.type==='quit')){setRecordLeave(action);return;}
     if (action.type === 'section' && action.section === section) return;
     if (action.type === 'tab' && action.tab === tab) return;
     if ((action.type === 'item' || action.type === 'pin') && action.item.id === draft?.id && section === (action.item.kind === 'sticky' ? 'stickies' : 'notes')) return;
+    capturePosition();
+    if(action.type==='section'||action.type==='tab'||action.type==='configure'){void doAction(action);return;}
+    // 隐藏栏目中的未保存草稿仍受退出保护；逐条处理后才允许真正退出。
+    if((action.type==='hide'||action.type==='quit')&&anyDirty){const d=draft&&isDirty?draft:Object.values(drafts).find(dirtyDraft);if(d){navigate(d.kind==='sticky'?'stickies':'notes','+ 新建');setPending(action);return;}}
+    const replacing=action.type==='new'||action.type==='pin'||action.type==='item'||action.type==='transcript';
+    const targetKind=action.type==='new'?action.kind:action.type==='pin'||action.type==='item'?action.item.kind:action.type==='transcript'?'note':kind;
+    if((action.type==='pin'||action.type==='item')&&targetKind&&drafts[targetKind]?.id===action.item.id){navigate(targetKind==='sticky'?'stickies':'notes','+ 新建');return;}
+    if(replacing&&targetKind&&dirtyDraft(drafts[targetKind])){navigate(targetKind==='sticky'?'stickies':'notes','+ 新建');setPending(action);return;}
     if (isDirty) { setPending(action); return; }
     if (audioGuard.current?.dirty()) { setAudioPending(action); return; }
     void doAction(action);
@@ -223,7 +260,7 @@ function App() {
       if (after) {
         setPending(null);
         if (after.type === 'trash') setDeleteConfirm({ type: 'trash', item });
-        else await doAction(after);
+        else if(after.type==='quit'||after.type==='hide'){const remaining=Object.values(drafts).find(d=>d?.kind!==draft.kind&&dirtyDraft(d));if(remaining){navigate(remaining.kind==='sticky'?'stickies':'notes','+ 新建');setPending(after);}else if(audioGuard.current?.dirty())setAudioPending(after);else await doAction(after);}else await doAction(after);
       }
     } catch (error) { setSaveError(String(error)); }
     finally { setSaving(false); }
@@ -244,6 +281,8 @@ function App() {
     // 放弃草稿时还原已保存快照；托盘恢复不能重新出现被放弃的文字。
     setDraft((current) => current?.id ? { ...current, title: current.savedTitle, body: current.savedBody, bodyJson: current.savedBodyJson } : null);
     setEditorSession((value) => value + 1);
+    if(next&&(next.type==='quit'||next.type==='hide')){const remaining=Object.values(drafts).find(d=>d?.kind!==draft?.kind&&dirtyDraft(d));if(remaining){navigate(remaining.kind==='sticky'?'stickies':'notes','+ 新建');setPending(next);return;}}
+    if(next&&(next.type==='quit'||next.type==='hide')&&audioGuard.current?.dirty()){setAudioPending(next);return;}
     if (next) void doAction(next);
   };
   const confirmDelete = async () => {
@@ -309,7 +348,7 @@ function App() {
     </div>
 
     <header className="titlebar">
-      <div className="brand-drag" onMouseDown={(event) => { if (event.button === 0) void appWindow.startDragging(); }}>
+      <div className="brand-drag" onMouseDown={(event) => { if (event.button === 0&&!maximized){event.preventDefault();void invoke('begin_grip_drag').catch(e=>setActionError(String(e)));} }}>
         {/* 品牌使用完整矢量图，固定渐变，不叠加主题底框；禁用图片拖动以保留窗口拖动。 */}
         <img className="brand-icon" src={brandIcon} alt="" draggable={false} /><span className="brand-name">轻笺</span>
       </div>
@@ -319,10 +358,12 @@ function App() {
         <button className="icon-button" title="提醒中心" aria-label="提醒中心" aria-expanded={bellOpen} onClick={() => setBellOpen((value) => !value)}><BellIcon /></button>
         <span className="title-separator" />
         <button className="icon-button system-button" title="最小化" aria-label="最小化" onClick={() => void appWindow.minimize()}>−</button>
+        <button className="icon-button system-button" title={maximized?'还原':'最大化'} aria-label={maximized?'还原':'最大化'} disabled={sizeChanging} onClick={()=>{setSizeChanging(true);void invoke<boolean>('toggle_shell_maximize').then(setMaximized).catch(e=>setActionError(String(e))).finally(()=>setSizeChanging(false));}}>{maximized?<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8V4h12v12h-4"/><rect x="4" y="8" width="12" height="12"/></svg>:<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16"/></svg>}</button>
         <button className="icon-button system-button" title="关闭到托盘" aria-label="关闭到托盘" onClick={() => requestAction({ type: 'hide' })}>×</button>
       </div>
     </header>
     {actionError&&<div className="operation-error" role="alert">{actionError}<button onClick={()=>setActionError('')}>关闭提示</button></div>}
+    {tasks&&[tasks.textTest,tasks.formalOnline,tasks.audio].filter(t=>t.status==='running').map(t=><div className="operation-error" role="status" key={t.kind}>{t.label}正在进行{t.startedAt?` · 开始于 ${new Date(t.startedAt).toLocaleTimeString('zh-CN')}`:''}{t.progress?` · ${t.progress}`:''}{t.canCancel&&<button onClick={()=>void invoke(t.kind==='model_news_refresh'?'cancel_model_news':'cancel_online_test',t.kind==='model_news_refresh'?{}:{kind:'text'}).then(()=>invoke<TaskSnapshot>('task_status')).then(setTasks)}>取消</button>}</div>)}
     {bellOpen && <div className="bell-panel" role="dialog" aria-label="提醒中心">
       <div className="bell-heading"><strong>提醒中心</strong><button type="button" onClick={() => setBellOpen(false)} aria-label="关闭提醒中心">×</button></div>
       {reminders.filter((entry) => entry.status === 'pending').length === 0 ? <p className="bell-empty">暂无待处理提醒</p> :
@@ -343,13 +384,14 @@ function App() {
         return <button key={item} className={tab === item ? 'active' : ''} disabled={disabled} title={disabled ? item + '尚未接入' : undefined} onClick={() => item === '+ 新建' && isItem ? requestAction({ type: 'new', kind: section === 'stickies' ? 'sticky' : 'note' }) : requestAction({ type: 'tab', tab: item })}>{item}</button>;
       })}
     </nav>
-    <div className={'content-stage '+(section==='news'?'news-content-stage':section==='settings'&&tab==='录音'?'recording-content-stage':'')}>
+    <div ref={contentRef} className={'content-stage '+(section==='news'?'news-content-stage':section==='settings'&&tab==='录音'?'recording-content-stage':'')}>
       {section === 'news' && <section className="news-stage">
         {tab==='AI 新闻'?<NewsPanel/>:<FreeApiPanel/>}
       </section>}
       {showItemWorkspace && <div className="items-stage">
+        <div className="items-import-toolbar"><button disabled={saving||importSaving||!!pending||!!audioPending} onClick={()=>{capturePosition();setImportKind(section==='stickies'?'sticky':'note');}}>导入</button></div>
         {actionError && <div className="operation-error" role="alert">{actionError}</div>}
-        <ItemWorkspace kind={section === 'stickies' ? 'sticky' : 'note'} view={tab as ItemView} items={items[section === 'stickies' ? 'sticky' : 'note']} trashed={trashed[section === 'stickies' ? 'sticky' : 'note']} reminders={reminders} draft={draft?.kind === (section === 'stickies' ? 'sticky' : 'note') ? draft : null} editorSession={editorSession} loading={loading} error={dataError} saveError={saveError} status={status} onSelect={(item) => requestAction({ type: 'item', item })}
+        <ItemWorkspace key={section} kind={section === 'stickies' ? 'sticky' : 'note'} view={tab as ItemView} items={items[section === 'stickies' ? 'sticky' : 'note']} trashed={trashed[section === 'stickies' ? 'sticky' : 'note']} reminders={reminders} draft={draft?.kind === (section === 'stickies' ? 'sticky' : 'note') ? draft : null} editorSession={editorSession} loading={loading} error={dataError} saveError={saveError} status={status} onSelect={(item) => requestAction({ type: 'item', item })}
           onTitleChange={(title) => { setDraft((current) => current ? { ...current, title } : null); setSaveError(''); setStatus(''); }}
           onBodyChange={(body, bodyJson) => { setDraft((current) => current ? { ...current, body, bodyJson } : null); setSaveError(''); setStatus(''); }}
           onDelete={(item) => requestAction({ type: 'trash', item })} onRestore={(item) => void restore(item)} onPermanent={(item) => { setActionError(''); setDeleteConfirm({ type: 'forever', item }); }} onReload={() => void reload()}
@@ -372,7 +414,15 @@ function App() {
       </section>}
     </div>
 
-    {recordLeave&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-label="正在录音"><h2>录音仍在进行</h2><p>停止后音频会临时保留，可稍后转写；也可继续录音。</p>{saveError&&<p role="alert">{saveError}</p>}<div className="dialog-actions"><button onClick={()=>void(async()=>{try{await invoke('stop_recording');setRecording(false);const a=recordLeave;setRecordLeave(null);if(isDirty)setPending(a);else void doAction(a);}catch(e){setSaveError(String(e));}})()}>停止并暂存音频后继续</button>{recordLeave.type==='hide'&&<button onClick={()=>{const a=recordLeave;setRecordLeave(null);if(isDirty)setPending(a);else void doAction(a);}}>继续录音并进入托盘</button>}<button onClick={()=>setRecordLeave(null)}>取消</button></div></section></div>}
+    {importKind&&<DocumentImportDialog defaultKind={importKind} preferences={{theme,fontSize}} onClose={()=>setImportKind(null)} onSaving={setImportSaving} onImported={reload} onView={id=>{
+      // 打开结果仍走既有草稿保护，不因导入而替换或自动保存当前编辑内容。
+      setImportKind(null);void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'pin',item})).catch(e=>setActionError(String(e)));
+    }}/ >}
+
+    {/* 高窗口从底部握柄上拖，中心也能进入顶部区域；不改变中心判定规则。 */}
+    <button className="window-drag-grip" title="拖动窗口；贴边松手 0.5 秒后隐藏" aria-label="拖动窗口" disabled={maximized} onMouseDown={event=>{if(event.button===0&&!maximized){event.preventDefault();void invoke("begin_grip_drag");}}}><span /></button>
+
+    {recordLeave&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-label="正在录音"><h2>录音仍在进行</h2><p>停止后音频会临时保留，可稍后转写；也可继续录音。</p>{saveError&&<p role="alert">{saveError}</p>}<div className="dialog-actions"><button onClick={()=>void(async()=>{try{await invoke('stop_recording');setRecording(false);const a=recordLeave;setRecordLeave(null);if(anyDirty){const d=Object.values(drafts).find(dirtyDraft);if(d)navigate(d.kind==='sticky'?'stickies':'notes','+ 新建');setPending(a);}else void doAction(a);}catch(e){setSaveError(String(e));}})()}>停止并暂存音频后继续</button>{recordLeave.type==='hide'&&<button onClick={()=>{const a=recordLeave;setRecordLeave(null);if(anyDirty){const d=Object.values(drafts).find(dirtyDraft);if(d)navigate(d.kind==='sticky'?'stickies':'notes','+ 新建');setPending(a);}else void doAction(a);}}>继续录音并进入托盘</button>}<button onClick={()=>setRecordLeave(null)}>取消</button></div></section></div>}
     {audioPending&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-modal="true" aria-label="未保存的转写校对"><h2>有未保存的校对</h2><p>保存当前转写或纪要的修改？</p><div className="dialog-actions"><button disabled={audioSaving} onClick={()=>void(async()=>{setAudioSaving(true);try{if(await audioGuard.current?.save()){const next=audioPending;setAudioPending(null);await doAction(next);}}finally{setAudioSaving(false);}})()}>{audioSaving?'保存中…':'保存'}</button><button disabled={audioSaving} onClick={()=>{audioGuard.current?.discard();const next=audioPending;setAudioPending(null);void doAction(next);}}>放弃</button><button disabled={audioSaving} onClick={()=>setAudioPending(null)}>继续编辑</button></div></section></div>}
     {pending && <div className="dialog-backdrop"><div className="leave-dialog" role="dialog" aria-modal="true" aria-labelledby="leave-title">
       <h2 id="leave-title">有未保存的内容</h2><p>要保存这次{draft?.kind === 'note' ? '笔记' : '便签'}修改吗？</p>

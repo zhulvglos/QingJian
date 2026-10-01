@@ -1,14 +1,15 @@
-import {useEffect,useState} from 'react';
+import {useEffect,useState,useRef} from 'react';
+import {useRunState} from './run_session';
 import {invoke} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 type Config={root:string;engine?:'sensevoice';sensePython?:string;senseRuntime?:string;senseModels?:string;available:boolean;processing?:boolean;installation?:{state?:string;error?:string};validation?:{transcribed?:boolean;integrity?:boolean}};
 export function VoiceSettings(){return <section className="model-settings"><h1>语音</h1><LocalVoiceSettings/><OnlineEditor kind="audio"/></section>;}
 function LocalVoiceSettings(){
- const [config,setConfig]=useState<Config>({root:'',available:false}),[busy,setBusy]=useState(false),[dirty,setDirty]=useState(false),[error,setError]=useState(''),[progress,setProgress]=useState('');
+ const [config,setConfig]=useRunState<Config>('voice.config',{root:'',available:false}),[busy,setBusy]=useRunState('voice.busy',false),[dirty,setDirty]=useRunState('voice.dirty',false),[error,setError]=useRunState('voice.error',''),[progress,setProgress]=useRunState('voice.progress','');
  useEffect(()=>{
   let active=true;
   let polling=false;const load=()=>invoke<Config>('audio_config').then(c=>{if(active){setConfig(c);polling=!!c.processing;}});
-  void load().catch(e=>{if(active)setError(String(e));});
+  if(!dirty)void load().catch(e=>{if(active)setError(String(e));});
   const timer=setInterval(()=>{if(active&&polling)void load();},2000);
   const stage=listen<string>('local-model-stage',e=>{if(active){setProgress(e.payload);polling=true;}});
   return()=>{active=false;clearInterval(timer);void stage.then(f=>f());};
@@ -27,19 +28,24 @@ function LocalVoiceSettings(){
 }
 
 type OnlineConfig={endpoint?:string;model?:string;hasKey?:boolean;tested?:boolean;testedAt?:string;revision?:string;audioProtocol?:string;testPreview?:string};
+type TestStatus={id?:string;status:'idle'|'running'|'success'|'failure'|'cancelled';error?:string;diagnostics?:{httpStatus:number;finishReason:string;answerCharacters:number;reasoningCharacters:number;outputBudget:number;thinkingDisabled:boolean}};
 export function OnlineSettings(){return <section className="model-settings"><h1>文字模型</h1><p className="news-meta">用于转写纪要与模型资讯筛选。</p><OnlineEditor kind="text"/></section>;}
 
 function conciseError(error:string):string {
  const code=error.match(/HTTP\s*(\d{3})/)?.[1];
- if(code) return ({'401':'密钥无效','403':'没有访问权限','404':'地址或模型不支持此功能','429':'请求限流或额度不足'} as Record<string,string>)[code] || `服务返回 HTTP ${code}`;
+ if(code&&Number(code)>=300) return ({'401':'密钥无效','402':'账户欠费或余额不足','403':'没有访问权限','404':'地址或模型不支持此功能','429':'请求限流或额度不足'} as Record<string,string>)[code] || `服务返回 HTTP ${code}`;
  if(error.includes('连接失败或超时')) return '连接失败或超时';
  if(/超时|timeout/i.test(error)) return '连接超时';
  if(/连接|connect/i.test(error)) return '无法连接服务';
  return error.split(/[\n；;]/)[0].slice(0,64);
 }
 function OnlineEditor({kind}:{kind:'audio'|'text'}){
- const [config,setConfig]=useState<OnlineConfig>({}),[secret,setSecret]=useState(''),[dirty,setDirty]=useState(false),[busy,setBusy]=useState(false),[testing,setTesting]=useState(false),[operation,setOperation]=useState('测试'),[error,setError]=useState('');
- useEffect(()=>{let active=true;void invoke<OnlineConfig>('online_config',{kind}).then(c=>{if(active)setConfig(c);}).catch(e=>{if(active)setError(String(e));});return()=>{active=false;};},[kind]);
+ const prefix='online.'+kind;
+ const [config,setConfig]=useRunState<OnlineConfig>(prefix+'.config',{}),[secret,setSecret]=useRunState(prefix+'.secret',''),[dirty,setDirty]=useRunState(prefix+'.dirty',false),[busy,setBusy]=useRunState(prefix+'.busy',false),[testing,setTesting]=useRunState(prefix+'.testing',false),[testStatus,setTestStatus]=useRunState<TestStatus>(prefix+'.testStatus',{status:'idle'}),[operation,setOperation]=useRunState(prefix+'.operation','测试'),[error,setError]=useRunState(prefix+'.error','');
+ const [loaded,setLoaded]=useRunState(prefix+'.loaded',false);const dirtyRef=useRef(dirty);dirtyRef.current=dirty;
+ // 未提交配置仅保留在进程内存；返回页面不能重新读取覆盖它，更不能自动保存或启动测试。
+ useEffect(()=>{if(loaded)return;let active=true;void invoke<OnlineConfig>('online_config',{kind}).then(c=>{if(active){if(!dirtyRef.current)setConfig(c);setLoaded(true);}}).catch(e=>{if(active)setError(String(e));});return()=>{active=false;};},[kind,loaded]);
+ useEffect(()=>{if(kind!=='text')return;let active=true;const refresh=async()=>{try{const state=await invoke<TestStatus>('online_test_status',{kind});if(!active)return;setTestStatus(previous=>{if(previous.status!=='success'&&state.status==='success')void invoke<OnlineConfig>('online_config',{kind}).then(c=>{if(active&&!dirtyRef.current)setConfig(c);}).catch(e=>{if(active)setError(String(e));});return state;});}catch(e){if(active)setError(String(e));}};void refresh();const timer=window.setInterval(()=>void refresh(),1000);return()=>{active=false;window.clearInterval(timer);};},[kind]);
  const run=async(fn:()=>Promise<void>)=>{setBusy(true);setError('');try{await fn();}catch(e){setError(String(e));}finally{setBusy(false);setTesting(false);}};
  // 任意字段变更立即撤销旧测试的展示，凭据仍只交由原有系统存储处理。
  const change=()=>{setDirty(true);setError('');setConfig(c=>({...c,tested:false,testPreview:undefined}));};
@@ -50,10 +56,12 @@ function OnlineEditor({kind}:{kind:'audio'|'text'}){
   <div className="file-actions">
    <button onClick={()=>{setOperation('保存');void run(async()=>{setConfig(await invoke<OnlineConfig>('save_online_config',{kind,endpoint:config.endpoint||'',model:config.model||'',apiKey:secret||null,clearKey:false}));setSecret('');setDirty(false);});}}>保存</button>
    <button disabled={!config.hasKey} onClick={()=>{setOperation('移除密钥');void run(async()=>{setConfig(await invoke<OnlineConfig>('save_online_config',{kind,endpoint:config.endpoint||'',model:config.model||'',apiKey:null,clearKey:true}));setSecret('');setDirty(false);});}}>移除密钥</button>
-   <button disabled={dirty||!config.hasKey} onClick={()=>{setOperation('测试');setTesting(true);setConfig(c=>({...c,tested:false,testPreview:undefined}));void run(async()=>{setConfig(await invoke<OnlineConfig>('test_online_model',{kind,confirmed:true}));});}}>测试</button>
+   <button disabled={dirty||!config.hasKey||testStatus.status==='running'} onClick={()=>{setOperation('测试');setConfig(c=>({...c,tested:false,testPreview:undefined}));if(kind==='text'){setError('');void invoke<TestStatus>('test_online_model',{kind,confirmed:true}).then(setTestStatus).catch(e=>setError(String(e)));}else{setTesting(true);void run(async()=>{setConfig(await invoke<OnlineConfig>('test_online_model',{kind,confirmed:true}));});}}}>测试</button>
+   {kind==='text'&&testStatus.status==='running'&&<button onClick={()=>void invoke<TestStatus>('cancel_online_test',{kind}).then(setTestStatus).catch(e=>setError(String(e)))}>取消测试</button>}
   </div>
-  <p role="status" className={error?'error-text':''}>{testing?'测试中…':error?operation+'失败：'+conciseError(error):dirty?'配置已修改，请先保存':config.tested?'连接成功':'尚未测试'}</p>
+  <p role="status" className={error||testStatus.status==='failure'?'error-text':''}>{kind==='text'&&testStatus.status==='running'?'连接测试中…':kind==='text'&&testStatus.status==='cancelled'?'连接测试已取消':kind==='text'&&testStatus.status==='failure'?'测试失败：'+conciseError(testStatus.error||''):testing?'测试中…':error?operation+'失败：'+conciseError(error):dirty?'配置已修改，请先保存':config.tested?'连接成功':'尚未测试'}</p>
   {config.testPreview&&!dirty&&config.tested&&<p className="model-test-preview">{config.testPreview}</p>}
-  {error&&<details className="model-error"><summary>查看详情</summary><p>{error}</p></details>}
+  {(error||testStatus.status==='failure')&&<details className="model-error"><summary>查看详情</summary><p>{error||testStatus.error}</p></details>}
+  {kind==='text'&&testStatus.status==='success'&&testStatus.diagnostics&&<details className="model-error"><summary>测试诊断（脱敏）</summary><p>HTTP {testStatus.diagnostics.httpStatus} · finish_reason：{testStatus.diagnostics.finishReason} · 最终回答 {testStatus.diagnostics.answerCharacters} 字 · 思考内容 {testStatus.diagnostics.reasoningCharacters} 字 · 输出预算 {testStatus.diagnostics.outputBudget} tokens · 非流式{testStatus.diagnostics.thinkingDisabled?' · 已关闭思考':''}</p></details>}
  </fieldset>;
 }

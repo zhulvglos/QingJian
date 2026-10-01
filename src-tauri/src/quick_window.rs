@@ -43,6 +43,7 @@ pub fn create_quick(app: &mut tauri::App) -> tauri::Result<()> {
     // Windows owner 关系让外侧标签位于主窗口上方，并随主窗口最小化。
     WebviewWindowBuilder::new(app, "quick", WebviewUrl::App("quick.html".into()))
         .parent(&main)?
+        .data_directory(app.state::<crate::data_root::DataRoot>().0.join("webview"))
         .title("轻笺快捷标签")
         .inner_size(46.0, 118.0)
         .decorations(false)
@@ -146,7 +147,7 @@ pub fn sync_quick(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     quick.set_size(PhysicalSize::new(width as u32, height as u32))?;
     quick.set_position(PhysicalPosition::new(x, y))?;
-    quick.show()?;
+    crate::window_native::show_no_activate(&quick)?;
     quick.emit("quick-side", side.as_str())?;
     Ok(())
 }

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode, type CSSProperties } from 'react';
+import {useRunState} from './run_session';
 
 export function SplitView({ list, detail, storageKey }: { list: ReactNode; detail: ReactNode; storageKey: string }) {
   const root = useRef<HTMLDivElement>(null);
-  const [ratio, setRatio] = useState(40);
-  const [height, setHeight] = useState(60);
+  const [ratio, setRatio] = useRunState(storageKey+'.ratio',40);
+  const [height, setHeight] = useRunState(storageKey+'.height',60);
   const cleanup = useRef<() => void>(() => {});
   useEffect(() => () => cleanup.current(), []);
   const move = (x: number, y: number) => {

@@ -54,12 +54,17 @@ function inlineText(node: JSONContent): string {
 }
 
 export function documentText(document: JSONContent): string {
+  // 导入的普通列表与嵌套段落同样保留行分隔，编辑保存后仍可读、可搜索。
+  const blockText = (node: JSONContent): string => {
+    if (['bulletList','orderedList','taskList','listItem','taskItem','blockquote','doc'].includes(node.type ?? '')) return (node.content ?? []).map(blockText).join('\n');
+    return inlineText(node);
+  };
   const lines: string[] = [];
   for (const node of document.content ?? []) {
     if (node.type === 'taskList') {
       for (const item of node.content ?? []) lines.push((item.content ?? []).map(inlineText).join('\n'));
     } else {
-      lines.push(inlineText(node));
+      lines.push(blockText(node));
     }
   }
   return lines.join('\n');

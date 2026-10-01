@@ -2,17 +2,33 @@ use crate::audio::{setting,save_setting,session};
 use serde_json::{json,Value};
 use base64::{engine::general_purpose::STANDARD,Engine};
 use sha2::{Digest,Sha256};
-use std::{io::Read,time::Duration};
+use std::{collections::HashMap,io::Read,sync::{Mutex,OnceLock},time::Duration};
+use tokio::sync::oneshot;
 static ACTIVE_TASKS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_SINCE:Mutex<Option<String>>=Mutex::new(None);
+static LAST_ONLINE:Mutex<Option<(String,String)>>=Mutex::new(None);
 pub fn processing()->bool{ACTIVE_TASKS.load(std::sync::atomic::Ordering::Relaxed)>0}
-struct OnlineGuard;impl OnlineGuard{fn new()->Self{ACTIVE_TASKS.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Self}}impl Drop for OnlineGuard{fn drop(&mut self){ACTIVE_TASKS.fetch_sub(1,std::sync::atomic::Ordering::SeqCst);}}
+pub fn task_snapshot()->Value{let since=ACTIVE_SINCE.lock().ok().and_then(|s|s.clone());let last=LAST_ONLINE.lock().ok().and_then(|s|s.clone());json!({"kind":"formal_online","label":"正式转写或纪要请求","status":if processing(){"running"}else if last.is_some(){"finished"}else{"idle"},"startedAt":since.or_else(||last.as_ref().map(|s|s.0.clone())),"endedAt":last.map(|s|s.1),"canCancel":false})}
+struct TestState{id:String,status:&'static str,error:String,diagnostics:Option<Value>,started_at:String,ended_at:Option<String>,cancel:Option<oneshot::Sender<()>>}
+static TESTS:OnceLock<Mutex<HashMap<String,TestState>>>=OnceLock::new();
+fn tests()->&'static Mutex<HashMap<String,TestState>>{TESTS.get_or_init(||Mutex::new(HashMap::new()))}
+fn test_snapshot(kind:&str)->Result<Value,String>{kind_key(kind)?;let states=tests().lock().map_err(|_|"测试状态暂不可用")?;Ok(match states.get(kind){Some(s)=>json!({"id":s.id,"kind":format!("{kind}_connection_test"),"label":format!("{}连接测试",if kind=="text"{"文字模型"}else{"语音模型"}),"status":s.status,"error":s.error,"diagnostics":s.diagnostics,"startedAt":s.started_at,"endedAt":s.ended_at,"canCancel":s.status=="running"}),None=>json!({"kind":format!("{kind}_connection_test"),"status":"idle"})})}
+pub fn cancel_tests(){if let Ok(mut states)=tests().lock(){for state in states.values_mut(){if state.status=="running"{if let Some(cancel)=state.cancel.take(){let _=cancel.send(());}state.status="cancelled";state.ended_at=Some(chrono::Utc::now().to_rfc3339());state.error="连接测试已取消".into();}}}}
+#[tauri::command]pub fn online_test_status(kind:String)->Result<Value,String>{test_snapshot(&kind)}
+#[tauri::command]pub fn cancel_online_test(kind:String)->Result<Value,String>{kind_key(&kind)?;let mut states=tests().lock().map_err(|_|"测试状态暂不可用")?;if let Some(s)=states.get_mut(&kind){if s.status=="running"{if let Some(cancel)=s.cancel.take(){let _=cancel.send(());}s.status="cancelled";s.ended_at=Some(chrono::Utc::now().to_rfc3339());s.error="连接测试已取消".into();}}drop(states);test_snapshot(&kind)}
+struct OnlineGuard;impl OnlineGuard{fn new()->Self{if ACTIVE_TASKS.fetch_add(1,std::sync::atomic::Ordering::SeqCst)==0{if let Ok(mut since)=ACTIVE_SINCE.lock(){*since=Some(chrono::Utc::now().to_rfc3339());}}Self}}impl Drop for OnlineGuard{fn drop(&mut self){if ACTIVE_TASKS.fetch_sub(1,std::sync::atomic::Ordering::SeqCst)==1{if let Ok(mut since)=ACTIVE_SINCE.lock(){if let Some(start)=since.take(){if let Ok(mut last)=LAST_ONLINE.lock(){*last=Some((start,chrono::Utc::now().to_rfc3339()));}}}}}}
 fn err(e:impl std::fmt::Display)->String{e.to_string()}
 fn kind_key(kind:&str)->Result<String,String>{if !["audio","text"].contains(&kind){return Err("模型用途无效".into());}Ok(format!("online_{kind}"))}
-fn credential(kind:&str)->Result<keyring::Entry,String>{kind_key(kind)?;let profile=std::env::var("LOCALAPPDATA").unwrap_or_default();let scope=format!("QingjianV1.{:x}",Sha256::digest(profile.as_bytes()));keyring::Entry::new(&scope,kind).map_err(|_|"Windows 凭据存储不可用".into())}
+fn credential(kind:&str)->Result<keyring::Entry,String>{kind_key(kind)?;let profile=std::env::var("LOCALAPPDATA").unwrap_or_default();let prefix=if std::env::var_os("QINGJIAN_TEST_MODE").is_some(){"QingjianV1_Test"}else{"QingjianV1"};let scope=format!("{prefix}.{:x}",Sha256::digest(profile.as_bytes()));keyring::Entry::new(&scope,kind).map_err(|_|"Windows 凭据存储不可用".into())}
 #[tauri::command]pub fn online_config(kind:String,app:tauri::AppHandle)->Result<Value,String>{let mut c=setting(&app,&kind_key(&kind)?)?;c["hasKey"]=json!(credential(&kind)?.get_password().is_ok());Ok(c)}
 #[tauri::command]pub fn save_online_config(kind:String,endpoint:String,model:String,api_key:Option<String>,clear_key:bool,app:tauri::AppHandle)->Result<Value,String>{
  if processing()||crate::audio::processing(){return Err("模型请求正在进行，请完成后再修改配置".into());}let name=kind_key(&kind)?;let endpoint=endpoint.trim().trim_end_matches('/');let u=reqwest::Url::parse(endpoint).map_err(|_|"服务端点不是有效地址")?;
- if u.scheme()!="https"||!u.username().is_empty()||u.password().is_some()||u.query().is_some()||u.fragment().is_some(){return Err("服务端点须使用 HTTPS，不能包含凭据、查询参数或片段".into());}if model.trim().is_empty(){return Err("请输入对应能力的模型名称".into());}
+ let local_mock=std::env::var_os("QINGJIAN_TEST_MODE").is_some()&&u.scheme()=="http"&&matches!(u.host_str(),Some("127.0.0.1"|"localhost"));
+ if (u.scheme()!="https"&&!local_mock)||!u.username().is_empty()||u.password().is_some()||u.query().is_some()||u.fragment().is_some(){return Err("服务端点须使用 HTTPS，不能包含凭据、查询参数或片段".into());}if model.trim().is_empty(){return Err("请输入对应能力的模型名称".into());}
+ // 改动文字模型配置时，旧资讯筛选不能再用失效配置写回成功缓存。
+ if kind=="text"{crate::model_news::cancel();}
+ // 新配置使进行中的连接测试失效，旧响应不能再写回成功状态。
+ if let Ok(mut states)=tests().lock(){if let Some(mut test)=states.remove(&kind){if let Some(cancel)=test.cancel.take(){let _=cancel.send(());}}}
  // 修改任意配置先作废测试状态；密钥只交给Windows凭据存储。
  let changed_endpoint=setting(&app,&name)?["endpoint"].as_str().is_some_and(|old|old!=endpoint);let c=json!({"endpoint":endpoint,"model":model.trim(),"revision":uuid::Uuid::new_v4().to_string(),"tested":false,"testedAt":Value::Null});save_setting(&app,&name,&c)?;let key=credential(&kind)?;
  if clear_key||(changed_endpoint&&api_key.as_ref().is_none_or(|s|s.is_empty())) {match key.delete_credential(){Ok(())|Err(keyring::Error::NoEntry)=>{},Err(_)=>return Err("删除系统凭据失败".into())}}else if let Some(secret)=api_key.filter(|s|!s.is_empty()){key.set_password(&secret).map_err(|_|"无法保存 Windows 系统凭据")?;}
@@ -27,9 +43,10 @@ impl AudioProtocol{
  fn path(self)->&'static str{match self{Self::Multipart=>"audio/transcriptions",Self::ChatAudio=>"chat/completions"}}
  fn from_id(s:&str)->Result<Self,String>{match s{"multipart"=>Ok(Self::Multipart),"chat_audio"=>Ok(Self::ChatAudio),_=>Err("尚未识别音频接口，请先点击测试并自动适配".into())}}
 }
-fn failure_for_status(status:u16,url:&str)->ApiFailure{
+fn failure_for_status(status:u16,_url:&str)->ApiFailure{
  let hint=match status{
   401=>"服务拒绝认证，请检查该服务的API Key",
+  402=>"账户欠费或可用余额不足，请在供应商控制台确认",
   403=>"服务拒绝访问，请检查模型权限、地区或账户限制",
   404=>"此请求地址或模型不存在；不代表API Key一定错误",
   405|415|422=>"此接口不接受当前请求方式或音频格式",
@@ -40,14 +57,14 @@ fn failure_for_status(status:u16,url:&str)->ApiFailure{
   300..=399=>"服务要求跳转，请使用供应商提供的直接API地址",
   _=>"服务返回错误，当前协议未能完成请求",
  };
- ApiFailure{message:format!("HTTP {status}：{hint}。请求：{url}"),try_other:matches!(status,400|404|405|415|422)}
+ ApiFailure{message:format!("HTTP {status}：{hint}"),try_other:matches!(status,400|404|405|415|422)}
 }
 fn response_json(response:reqwest::blocking::Response,url:&str)->Result<Value,ApiFailure>{
  if !response.status().is_success(){return Err(failure_for_status(response.status().as_u16(),url));}
  // 不回显供应商错误原文：部分服务会把Key或请求内容写进错误体。
  let mut data=Vec::new();response.take(2_000_001).read_to_end(&mut data).map_err(|_|ApiFailure::stop("读取响应失败；未切换协议或重复提交"))?;
  if data.len()>2_000_000{return Err(ApiFailure::stop("服务响应超过2MB限制"));}
- serde_json::from_slice(&data).map_err(|_|ApiFailure{message:format!("{url} 返回的不是有效JSON，可能不是API地址"),try_other:true})
+ serde_json::from_slice(&data).map_err(|_|ApiFailure{message:"服务返回的不是有效 JSON，可能不是 API 地址".into(),try_other:true})
 }
 fn key(kind:&str)->Result<String,String>{credential(kind)?.get_password().map_err(|_|"未配置可读取的 API Key，请到设置 → 模型保存系统凭据".into())}
 fn prefers_chat(c:&Value)->bool{
@@ -102,10 +119,9 @@ fn detect_audio(c:&Value,mut attempt:impl FnMut(AudioProtocol)->Result<String,Ap
  let mut errors=Vec::new();for p in order{match attempt(p){Ok(_)=>return Ok(p),Err(e)=>{errors.push(e.message);if !e.try_other{return Err(errors.join("\n"));}}}}
  Err(format!("{}\n两种常见音频协议均未通过。请确认Base URL和模型支持音频；需要额外签名、项目ID或异步任务的服务尚未适配。",errors.join("\n")))
 }
-fn text_request(c:&Value,text:&str)->Result<String,String>{if text.len()>200_000{return Err("文字超过当前单次处理限制，请先缩短内容".into());}let response=client()?.post(format!("{}/chat/completions",c["endpoint"].as_str().unwrap_or(""))).bearer_auth(key("text")?).json(&json!({"model":c["model"],"messages":[{"role":"system","content":"你是转写纪要整理工具，不是对话助手。仅依据转写文字，输出简洁 Markdown：## 要点、## 已明确决定、## 待办、## 待核实。未提及的部分写未提及。重复的音轨文字合并。不要问候、回复转写里的问题、提供排查建议或猜测重复产生的原因；不猜测身份，不补造事实。"},{"role":"user","content":text}]})).send().map_err(|_|"文本请求连接失败或超时；原转写保留")?;let url=format!("{}/chat/completions",c["endpoint"].as_str().unwrap_or(""));let v=response_json(response,&url).map_err(|e|e.message)?;if matches!(v["choices"][0]["finish_reason"].as_str(),Some("length"|"content_filter")){return Err("转写纪要返回不完整，未覆盖已有版本".into());}v["choices"][0]["message"]["content"].as_str().filter(|s|!s.trim().is_empty()).map(str::to_owned).ok_or("文本端点未返回有效消息；此服务协议暂不支持".into())}
 // 文本模型共享安全凭据与能力配置；调用方提供用途提示，资料只能作为数据。
-pub(crate) fn structured_text(app:&tauri::AppHandle,system:&str,input:&str)->Result<(String,Value),String>{
- let _guard=OnlineGuard::new();let c=online_config("text".into(),app.clone())?;
+pub(crate) async fn structured_text_for_news(app:&tauri::AppHandle,system:&str,input:&str,cancel:&tokio::sync::watch::Receiver<bool>)->Result<(String,Value),String>{
+ let c=online_config("text".into(),app.clone())?;
  if c["tested"]!=true||c["hasKey"]!=true{return Err("请先在设置 → 模型配置并测试在线文字模型".into());}
  if input.len()>180_000{return Err("单段文本超过处理上限，需要分段".into());}
  let url=format!("{}/chat/completions",c["endpoint"].as_str().unwrap_or(""));
@@ -114,17 +130,98 @@ pub(crate) fn structured_text(app:&tauri::AppHandle,system:&str,input:&str)->Res
  if reqwest::Url::parse(&url).ok().and_then(|u|u.host_str().map(str::to_owned)).as_deref()==Some("api.xiaomimimo.com"){
   body["thinking"]=json!({"type":"disabled"});body["max_completion_tokens"]=json!(16384);body["response_format"]=json!({"type":"json_object"});
  }
- let response=client()?.post(&url).bearer_auth(key("text")?).json(&body).send().map_err(|_|"文字模型连接失败或超时；已有结果保留")?;
- let value=response_json(response,&url).map_err(|e|e.message)?;
+ // 资讯筛选可放弃，使用独立的异步请求；正式转写仍保持原有 300 秒保护。
+ let client=reqwest::Client::builder().connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(45)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"无法创建资讯筛选请求")?;
+ let secret=key("text")?;let mut stop=cancel.clone();
+ let request=async {let response=client.post(&url).bearer_auth(secret).json(&body).send().await.map_err(|e|if e.is_timeout(){"模型资讯请求超时"}else{"无法连接文字模型服务"})?;
+ if !response.status().is_success(){return Err(failure_for_status(response.status().as_u16(),"").message);}
+ let bytes=response.bytes().await.map_err(|e|if e.is_timeout(){"模型资讯响应超时"}else{"无法读取模型资讯响应"})?;
+ if bytes.len()>2_000_000{return Err("模型资讯响应超过2MB".into());}
+ let value:Value=serde_json::from_slice(&bytes).map_err(|_|"模型返回的不是有效 JSON")?;Ok(value)};
+ let value=tokio::select!{_ = stop.changed()=>return Err("模型资讯筛选已取消".into()),result=request=>result}?;
+ if *cancel.borrow(){return Err("模型资讯筛选已取消".into());}
  if matches!(value["choices"][0]["finish_reason"].as_str(),Some("length"|"content_filter")){return Err("模型结果不完整，未替换已有内容".into());}
  let text=value["choices"][0]["message"]["content"].as_str().filter(|s|!s.trim().is_empty()).ok_or("模型没有返回有效内容")?;
  Ok((text.into(),json!({"endpoint":c["endpoint"],"model":c["model"],"revision":c["revision"]})))
 }
-#[tauri::command]pub async fn test_online_model(kind:String,confirmed:bool,app:tauri::AppHandle)->Result<Value,String>{tauri::async_runtime::spawn_blocking(move||{let _guard=OnlineGuard::new();if !confirmed{return Err("请先确认测试请求内容与服务".into());}let name=kind_key(&kind)?;let mut c=setting(&app,&name)?;let revision=c["revision"].clone();c["tested"]=json!(false);save_setting(&app,&name,&c)?;
+// 只按已核实的主机与模型选择参数，不改变用户保存的地址、模型或密钥。
+fn text_test_body(c:&Value)->Value {
+ let host=reqwest::Url::parse(c["endpoint"].as_str().unwrap_or("")).ok().and_then(|u|u.host_str().map(str::to_owned)).unwrap_or_default();
+ let model=c["model"].as_str().unwrap_or("").to_ascii_lowercase();
+ let mut body=json!({"model":c["model"],"stream":false,"messages":[{"role":"user","content":"连接测试。请只回复：测试成功。"}],"max_tokens":1024});
+ if host=="api.xiaomimimo.com" && model.starts_with("mimo-v2.5") {
+  body.as_object_mut().unwrap().remove("max_tokens");
+  body["max_completion_tokens"]=json!(1024);body["thinking"]=json!({"type":"disabled"});
+ } else if host=="api.siliconflow.cn" && (model.contains("deepseek-v3.2")||model.contains("qwen3")) {
+  body["enable_thinking"]=json!(false);
+ } else if matches!(host.as_str(),"spark-api-open.xf-yun.com"|"maas-api.cn-huabei-1.xf-yun.com"|"maas-api.cn-hubei-1.xf-yun.com") && matches!(model.as_str(),"spark-x"|"spark-x2") {
+  body["thinking"]=json!({"type":"disabled"});
+ }
+ // Spark-X2.5-4B 的独立参数合同未确认，不套用旗舰模型的 thinking 参数；留足通用预算。
+ body
+}
+
+fn answer_text(v:&Value)->String {
+ if let Some(s)=v.as_str(){return s.to_owned();}
+ v.as_array().map(|parts|parts.iter().filter(|p|p["type"]=="text").filter_map(|p|p["text"].as_str()).collect::<Vec<_>>().join("")).unwrap_or_default()
+}
+
+// 诊断采用字段白名单：不输出地址、模型、请求、正文、思考原文、错误原文或未知字符串。
+fn text_test_response(status:u16,v:&Value,body:&Value)->Result<Value,String> {
+ let choice=&v["choices"][0];let content=answer_text(&choice["message"]["content"]);
+ let reasoning=answer_text(&choice["message"]["reasoning_content"]);
+ let finish=match choice["finish_reason"].as_str(){Some("stop")=>"stop",Some("length")=>"length",Some("content_filter")=>"content_filter",Some("tool_calls")=>"tool_calls",Some("function_call")=>"function_call",Some("eos")=>"eos",Some("end_turn")=>"end_turn",None=>"未提供",_=>"未识别"};
+ let code=v.get("code").or_else(||v["header"].get("code"));
+ let code_number=code.and_then(|c|c.as_i64().or_else(||c.as_str().and_then(|s|s.parse::<i64>().ok())));
+ let business_error=v.get("error").is_some_and(|e|!e.is_null()) || code.is_some_and(|c|!c.is_null() && !matches!(code_number,Some(0|200)));
+ let diagnostics=json!({"httpStatus":status,"businessError":business_error,"businessCode":code_number,"finishReason":finish,"answerCharacters":content.chars().count(),"reasoningCharacters":reasoning.chars().count(),"completionTokens":v["usage"]["completion_tokens"].as_u64(),"stream":false,"outputBudget":body.get("max_completion_tokens").or_else(||body.get("max_tokens")),"thinkingDisabled":body["thinking"]["type"]=="disabled"||body["enable_thinking"]==false});
+ let fail=|reason:String|Err(format!("{reason}；脱敏诊断：{diagnostics}"));
+ if !(200..300).contains(&status){return fail(failure_for_status(status,"").message);}
+ if business_error{return fail("HTTP 请求成功，但服务返回业务错误；供应商错误原文已隐藏".into());}
+ if finish=="length"{return fail("输出达到上限，被截断；测试未通过".into());}
+ if finish=="content_filter"{return fail("回答被供应商过滤；测试未通过".into());}
+ if !matches!(finish,"stop"|"eos"|"end_turn"|"未提供"){return fail("模型未正常结束文字回答；测试未通过".into());}
+ if content.trim().is_empty(){return fail(if !reasoning.trim().is_empty(){"服务只返回思考内容，没有最终回答；测试未通过"}else if choice["message"].get("content").is_none(){"服务响应缺少回答正文；请核对 Chat Completions 接口"}else{"服务返回的回答正文为空；测试未通过"}.into());}
+ if content.contains("<think>")||content.contains("</think>")||content.contains("<thinking>")||content.contains("</thinking>"){return fail("回答包含未分离的思考内容；未将其当作有效回答".into());}
+ if choice["message"].get("role").is_some_and(|role|role!="assistant"){return fail("响应角色不是 assistant；测试未通过".into());}
+ Ok(diagnostics)
+}
+
+// 连接测试独立于正式纪要任务。超时和取消会丢弃请求 future，状态由后端保留供切页后读取。
+async fn text_connection_test(c:&Value,secret:&str)->Result<Value,String>{
+ let url=format!("{}/chat/completions",c["endpoint"].as_str().unwrap_or(""));
+ let client=reqwest::Client::builder().connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(35)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"无法创建连接测试")?;
+ let body=text_test_body(c);
+ let response=client.post(url).bearer_auth(secret).json(&body).send().await.map_err(|e|if e.is_timeout(){"连接测试超时，请检查网络或服务响应".to_owned()}else{"无法连接模型服务，请检查网络和地址".to_owned()})?;
+ let status=response.status().as_u16();
+ let bytes=response.bytes().await.map_err(|e|if e.is_timeout(){"连接测试读取响应超时"}else{"无法读取连接测试响应"})?;
+ if bytes.len()>2_000_000{return Err("服务响应超过 2MB 限制".into());}
+ let value:Value=serde_json::from_slice(&bytes).map_err(|_|if (200..300).contains(&status){format!("HTTP {status}：响应不是有效 JSON；未回显响应内容")}else{failure_for_status(status,"").message})?;
+ text_test_response(status,&value,&body)
+}
+#[tauri::command]pub async fn test_online_model(kind:String,confirmed:bool,app:tauri::AppHandle)->Result<Value,String>{
+ if !confirmed{return Err("请先确认测试请求内容与服务".into());}
+ let name=kind_key(&kind)?;
+ if kind=="text"{
+  let mut c=setting(&app,&name)?;let revision=c["revision"].clone();let secret=key("text")?;
+  c["tested"]=json!(false);c["testedAt"]=Value::Null;save_setting(&app,&name,&c)?;
+  let (cancel_tx,cancel_rx)=oneshot::channel();let id=uuid::Uuid::new_v4().to_string();
+  {let mut states=tests().lock().map_err(|_|"测试状态暂不可用")?;if states.get("text").is_some_and(|s|s.status=="running"){return Err("连接测试正在进行，可先取消".into());}states.insert(kind.clone(),TestState{id:id.clone(),status:"running",error:String::new(),diagnostics:None,started_at:chrono::Utc::now().to_rfc3339(),ended_at:None,cancel:Some(cancel_tx)});}
+  tauri::async_runtime::spawn(async move{
+   let outcome=tokio::select!{_ = cancel_rx=>Err("连接测试已取消".to_owned()),r = tokio::time::timeout(Duration::from_secs(40),text_connection_test(&c,&secret))=>r.unwrap_or_else(|_|Err("连接测试超时，请检查网络或服务响应".into()))};
+   // 持锁检查任务 ID，防止取消或旧请求的迟到响应写回测试成功。
+   if let Ok(mut states)=tests().lock(){if let Some(s)=states.get_mut("text"){if s.id==id&&s.status=="running"{
+    s.cancel=None;s.ended_at=Some(chrono::Utc::now().to_rfc3339());
+    match outcome{Ok(diagnostics)=>{s.diagnostics=Some(diagnostics);if setting(&app,&name).ok().is_some_and(|now|now["revision"]==revision){c["tested"]=json!(true);c["testedAt"]=json!(chrono::Utc::now().to_rfc3339());match save_setting(&app,&name,&c){Ok(())=>s.status="success",Err(_)=>{s.status="failure";s.error="无法保存测试结果".into();}}}else{s.status="failure";s.error="测试期间配置已变化，请重新测试".into();}},Err(e)=>{s.status=if e=="连接测试已取消"{"cancelled"}else{"failure"};s.error=e;}}
+   }}}
+  });
+  return test_snapshot(&kind);
+ }
+ tauri::async_runtime::spawn_blocking(move||{let _guard=OnlineGuard::new();let mut c=setting(&app,&name)?;let revision=c["revision"].clone();c["tested"]=json!(false);save_setting(&app,&name,&c)?;
  let mut test_preview=None;if kind=="audio"{
  // 固定测试语音编译入程序，不访问用户录音，不依赖用户安装Python或语音工具。
  let data=include_bytes!("../fixtures/asr-connection-test.wav");let secret=key("audio")?;
- let protocol=detect_audio(&c,|p|{let text=audio_request(&c,data,p,&secret)?;if text.trim().is_empty(){return Err(ApiFailure::stop("服务收到音频但没有返回测试语音文字，能力测试未通过；请核对该模型是否支持语音识别"));}test_preview=Some(text.replace(&secret,"[已隐藏敏感信息]").chars().take(500).collect::<String>());Ok(text)})?;c["audioProtocol"]=json!(protocol.id());}else{text_request(&c,"连接与能力测试：请回复测试成功。")?;}
+ let protocol=detect_audio(&c,|p|{let text=audio_request(&c,data,p,&secret)?;if text.trim().is_empty(){return Err(ApiFailure::stop("服务收到音频但没有返回测试语音文字，能力测试未通过；请核对该模型是否支持语音识别"));}test_preview=Some(text.replace(&secret,"[已隐藏敏感信息]").chars().take(500).collect::<String>());Ok(text)})?;c["audioProtocol"]=json!(protocol.id());}
  if setting(&app,&name)?["revision"]!=revision{return Err("测试期间配置已变化，请重新测试".into());}c["tested"]=json!(true);c["testedAt"]=json!(chrono::Utc::now().to_rfc3339());save_setting(&app,&name,&c)?;let mut result=online_config(kind,app)?;if let Some(text)=test_preview{result["testPreview"]=json!(text);}Ok(result)
  }).await.map_err(err)?}
 pub(crate) fn process_sync(id:String,kind:String,text:Option<String>,confirmed_revision:String,source_version:Option<String>,app:tauri::AppHandle)->Result<Value,String>{let _guard=OnlineGuard::new();if crate::audio::active(){return Err("请先停止录音".into());}let c=setting(&app,&kind_key(&kind)?)?;if c["tested"]!=true||c["revision"].as_str()!=Some(&confirmed_revision){return Err("配置未通过测试或确认后发生变化，请重新测试并确认发送".into());}
@@ -170,5 +267,41 @@ mod adapter_tests {
   let(url,h)=server(vec![(404,json!({"error":"fixture"})),(200,json!({"choices":[{"finish_reason":"stop","message":{"content":"fixture-only"}}]}))]);let c=json!({"endpoint":url,"model":"fixture-asr"});
   assert_eq!(detect_audio(&c,|p|audio_request(&c,b"RIFF-fixture",p,"not-a-real-key")).unwrap(),AudioProtocol::ChatAudio);
   let r=h.join().unwrap();assert_eq!(r.len(),2);assert!(r[1].0.starts_with("POST /v1/chat/completions "));let body:Value=serde_json::from_slice(&r[1].1).unwrap();assert_eq!(body["messages"][0]["content"][0]["type"],"input_audio");assert_eq!(body["model"],"fixture-asr");let data=body["messages"][0]["content"][0]["input_audio"]["data"].as_str().unwrap();assert_eq!(STANDARD.decode(data).unwrap(),b"RIFF-fixture");
+ }
+ #[test]fn text_connection_uses_local_mock_and_classifies_errors(){
+  let(url,h)=server(vec![(200,json!({"choices":[{"message":{"content":"测试成功"}}]}))]);
+  let c=json!({"endpoint":url,"model":"fixture-text"});
+  assert!(tauri::async_runtime::block_on(text_connection_test(&c,"dummy-test-key")).is_ok());
+  let requests=h.join().unwrap();assert!(requests[0].0.starts_with("POST /v1/chat/completions "));
+  let body:Value=serde_json::from_slice(&requests[0].1).unwrap();assert_eq!(body["model"],"fixture-text");
+  assert_eq!(body["stream"],false);assert_eq!(body["max_tokens"],1024);
+  for (status,hint) in [(401,"认证"),(402,"余额"),(403,"访问"),(404,"模型"),(429,"限流")] {
+   let(url,h)=server(vec![(status,json!({"error":"dummy-test-key must stay hidden"}))]);
+   let result=tauri::async_runtime::block_on(text_connection_test(&json!({"endpoint":url,"model":"fixture-text"}),"dummy-test-key")).unwrap_err();
+   assert!(result.contains(hint));assert!(!result.contains("dummy-test-key"));h.join().unwrap();
+  }
+ }
+ #[test]fn test_protocol_parameters_are_scoped_to_confirmed_contracts(){
+  let make=|endpoint:&str,model:&str|text_test_body(&json!({"endpoint":endpoint,"model":model}));
+  let mimo=make("https://api.xiaomimimo.com/v1","mimo-v2.5-pro");assert_eq!(mimo["thinking"]["type"],"disabled");assert_eq!(mimo["max_completion_tokens"],1024);assert!(mimo.get("max_tokens").is_none());
+  let sf=make("https://api.siliconflow.cn/v1","deepseek-ai/DeepSeek-V3.2");assert_eq!(sf["enable_thinking"],false);
+  let spark=make("https://spark-api-open.xf-yun.com/x2","spark-x");assert_eq!(spark["thinking"]["type"],"disabled");
+  for(endpoint,model)in[("https://api.xiaomimimo.com.fake.example/v1","mimo-v2.5-pro"),("https://maas-api.cn-hubei-1.xf-yun.com/v2","spark-x2.5-4b"),("https://gateway.example/v1","other")]{let b=make(endpoint,model);assert!(b.get("thinking").is_none());assert!(b.get("enable_thinking").is_none());assert_eq!(b["stream"],false);}
+ }
+ #[test]fn local_response_branches_never_echo_sensitive_strings(){
+  let cases=vec![
+   (json!({"error":{"code":"dummy-test-key","message":"private request"}}),"业务错误"),
+   (json!({"code":10014,"message":"dummy-test-key"}),"业务错误"),
+   (json!({"choices":[{"finish_reason":"length","message":{"content":"partial dummy-test-key"}}]}),"截断"),
+   (json!({"choices":[{"finish_reason":"content_filter","message":{"content":""}}]}),"过滤"),
+   (json!({"choices":[{"finish_reason":"stop","message":{"content":null,"reasoning_content":"dummy-test-key"}}]}),"思考内容"),
+   (json!({"choices":[{"finish_reason":"stop","message":{}}]}),"缺少回答正文"),
+   (json!({"choices":[{"finish_reason":"stop","message":{"content":" "}}]}),"正文为空"),
+   (json!({"choices":[{"finish_reason":"dummy-test-key","message":{"content":"private request"}}]}),"未正常结束"),
+   (json!({"choices":[{"finish_reason":"stop","message":{"content":"<think>private request</think>"}}]}),"未分离"),
+  ];
+  for(value,hint)in cases{let(url,h)=server(vec![(200,value)]);let e=tauri::async_runtime::block_on(text_connection_test(&json!({"endpoint":url,"model":"fixture"}),"dummy-test-key")).unwrap_err();assert!(e.contains(hint),"{e}");assert!(e.contains("脱敏诊断"));assert!(!e.contains("dummy-test-key"));assert!(!e.contains("private request"));h.join().unwrap();}
+  let(url,h)=server(vec![(200,json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":[{"type":"reasoning","text":"private request"},{"type":"text","text":"测试成功"}],"reasoning_content":"dummy-test-key"}}],"usage":{"completion_tokens":123}}))]);
+  let d=tauri::async_runtime::block_on(text_connection_test(&json!({"endpoint":url,"model":"fixture"}),"dummy-test-key")).unwrap();assert_eq!(d["answerCharacters"],4);assert_eq!(d["completionTokens"],123);assert!(!d.to_string().contains("dummy-test-key"));h.join().unwrap();
  }
 }

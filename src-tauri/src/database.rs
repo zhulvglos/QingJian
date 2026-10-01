@@ -163,9 +163,8 @@ fn migrate_audio(conn:&mut Connection)->Result<(),String>{
         tx.execute_batch("CREATE TABLE audio_sessions(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,payload TEXT NOT NULL); INSERT INTO schema_migrations VALUES(5,strftime('%Y-%m-%dT%H:%M:%fZ','now')); PRAGMA user_version=5;").map_err(save_error)?;tx.commit().map_err(save_error)?;}
     Ok(())
 }
-pub fn open() -> Result<(Database, PathBuf), String> {
-    let base = std::env::var_os("LOCALAPPDATA").ok_or("无法确定当前用户的数据目录 LOCALAPPDATA")?;
-    let directory = PathBuf::from(base).join("SHUSHIN").join("Qingjian");
+pub fn open(directory: &std::path::Path) -> Result<(Database, PathBuf), String> {
+    let directory = directory.to_path_buf();
     std::fs::create_dir_all(&directory).map_err(|e| format!("创建数据目录失败：{e}"))?;
     let path = directory.join("qingjian-v1.sqlite3");
     let mut conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
@@ -219,11 +218,10 @@ pub fn delete_item_forever(id: String, database: State<'_, Database>) -> Result<
     Ok(())
 }
 
-#[tauri::command]
-pub fn save_item(input: SaveInput, database: State<'_, Database>) -> Result<Item, String> {
-    if input.kind != "sticky" && input.kind != "note" { return Err("内容类型无效".into()); }
-    if input.title.trim().is_empty() && input.body.trim().is_empty() { return Err("请输入标题或正文后再保存".into()); }
-    if let Some(document) = &input.body_json {
+pub(crate) fn validate_item_fields(kind:&str,title:&str,body:&str,body_json:Option<&str>)->Result<(),String>{
+    if kind != "sticky" && kind != "note" { return Err("内容类型无效".into()); }
+    if title.trim().is_empty() && body.trim().is_empty() { return Err("请输入标题或正文后再保存".into()); }
+    if let Some(document) = body_json {
         if document.len() > 2_000_000 { return Err("正文过长，请缩短后再保存".into()); }
         let value: serde_json::Value = serde_json::from_str(document).map_err(|_| "正文格式无效，草稿仍保留")?;
         let valid = value.get("format").and_then(|value| value.as_str()) == Some("qingjian-rich-v1")
@@ -232,6 +230,18 @@ pub fn save_item(input: SaveInput, database: State<'_, Database>) -> Result<Item
             && value.get("checks").and_then(|value| value.as_array()).is_some_and(|checks| checks.iter().all(|item| item.is_boolean()));
         if !valid { return Err("正文格式无效，草稿仍保留".into()); }
     }
+    Ok(())
+}
+// 与手动新建共用 ID、时间和排序规则；调用方负责事务，外部 ID 无入口。
+pub(crate) fn insert_new_item(conn:&Connection,kind:&str,title:&str,body:&str,body_json:Option<&str>)->Result<String,String>{
+    validate_item_fields(kind,title,body,body_json)?;
+    let id=Uuid::new_v4().to_string();
+    conn.execute("INSERT INTO items(id,kind,title,body,body_json,created_at,updated_at,sort_order) VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),(SELECT COALESCE(MIN(sort_order),0)-1 FROM items WHERE kind=?2 AND is_pinned=0))",params![id,kind,title,body,body_json]).map_err(save_error)?;
+    Ok(id)
+}
+#[tauri::command]
+pub fn save_item(input: SaveInput, database: State<'_, Database>) -> Result<Item, String> {
+    validate_item_fields(&input.kind,&input.title,&input.body,input.body_json.as_deref())?;
     let mut conn = database.0.lock().map_err(|_| "数据库暂时不可用")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(save_error)?;
     let id = if let Some(id) = input.id {
@@ -242,10 +252,7 @@ pub fn save_item(input: SaveInput, database: State<'_, Database>) -> Result<Item
         if changed != 1 { return Err("保存失败：条目已变化或不存在，请保留草稿并重新检查".into()); }
         id
     } else {
-        let id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO items(id,kind,title,body,body_json,created_at,updated_at,sort_order) VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),(SELECT COALESCE(MIN(sort_order),0)-1 FROM items WHERE kind=?2 AND is_pinned=0))",
-            params![id, input.kind, input.title, input.body, input.body_json]).map_err(save_error)?;
-        id
+        insert_new_item(&tx,&input.kind,&input.title,&input.body,input.body_json.as_deref())?
     };
     let item = tx.query_row("SELECT id,kind,title,body,body_json,created_at,updated_at,revision,is_pinned,sort_order FROM items WHERE id=?1", [&id], row_item).optional().map_err(save_error)?.ok_or("保存后未找到条目")?;
     tx.commit().map_err(save_error)?;

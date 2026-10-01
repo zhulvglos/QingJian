@@ -3,6 +3,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::{collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::Mutex, time::{Duration, Instant}};
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
+use crate::window_native::Bounds;
 use winreg::{enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE}, RegKey};
 
 #[repr(C)] struct Point { x:i32,y:i32 }
@@ -35,8 +36,28 @@ pub fn single_instance() -> Result<Option<Instance>,String> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default,rename_all="camelCase")]
 pub struct Settings { always_on_top:bool, edge_hide:bool, auto_start:bool, x:Option<i32>, y:Option<i32>, height:f64, error:String }
-impl Default for Settings { fn default()->Self{Self{always_on_top:false,edge_hide:false,auto_start:true,x:None,y:None,height:720.0,error:String::new()}} }
-pub struct Runtime { settings:Settings, hidden:Option<(i32,i32)>, busy:bool, outside_since:Option<Instant>, cooldown:Instant, last_save:Instant }
+impl Default for Settings { fn default()->Self{Self{always_on_top:false,edge_hide:false,auto_start:std::env::var_os("QINGJIAN_TEST_MODE").is_none(),x:None,y:None,height:720.0,error:String::new()}} }
+pub struct Runtime { settings:Settings, hidden:Option<(i32,i32)>, dock:Option<Dock>, sensor_armed:bool, busy:bool, drag_serial:u64, pending:Option<(Edge,Instant,u64,bool)>, last_save:Instant, repairs:u64 }
+#[derive(Clone,Copy)]struct Dock{edge:Edge,sensor:Bounds}
+#[derive(Clone,Copy,Debug,PartialEq,Serialize)]
+#[serde(rename_all="lowercase")]
+enum Edge {Left,Right,Top}
+fn contact(v:Bounds,s:Bounds,dx:i32,dy:i32)->Option<Edge>{
+    // 全部使用物理像素的可见边界；最多允许 1 px 取整误差，不计阴影或缩放框。
+    let candidates=[(Edge::Left,s.left-v.left,-dx),(Edge::Right,v.right-s.right,dx),(Edge::Top,s.top-v.top,-dy)];
+    candidates.into_iter().filter(|(_,depth,_)|*depth>=-1).max_by(|a,b|{
+        // 角落优先遵循实际朝向该边的拖动；同向时比较穿越深度，最终固定排序保证稳定。
+        a.2.max(0).cmp(&b.2.max(0)).then(a.1.cmp(&b.1))
+    }).map(|c|c.0)
+}
+fn sensor(edge:Edge,v:Bounds,s:Bounds)->Bounds{
+    // 纯光标检测，没有感应窗口，不截获点击；长度仅覆盖隐藏前窗口占用的边缘范围。
+    match edge{
+        Edge::Left=>Bounds{left:s.left,right:s.left+2,top:v.top.max(s.top),bottom:v.bottom.min(s.bottom)},
+        Edge::Right=>Bounds{left:s.right-2,right:s.right,top:v.top.max(s.top),bottom:v.bottom.min(s.bottom)},
+        Edge::Top=>Bounds{left:v.left.max(s.left),right:v.right.min(s.right),top:s.top,bottom:s.top+2},
+    }
+}
 fn registry_name()->String {if std::env::var_os("QINGJIAN_TEST_MODE").is_some(){"QingjianV1_Test".into()}else{"QingjianV1".into()}}
 fn startup_command()->Result<String,String>{Ok(format!("\"{}\" --autostart",std::env::current_exe().map_err(|e|e.to_string())?.display()))}
 fn set_autostart(enabled:bool)->Result<(),String> {
@@ -54,9 +75,35 @@ fn persist(app:&tauri::AppHandle,settings:&Settings)->Result<(),String>{
 }
 pub fn is_hidden(app:&tauri::AppHandle)->bool {app.try_state::<Mutex<Runtime>>().is_some_and(|s|s.lock().map(|s|s.hidden.is_some()).unwrap_or(false))}
 pub fn restore(app:&tauri::AppHandle){
-    let pos=app.try_state::<Mutex<Runtime>>().and_then(|s|{let mut r=s.lock().ok()?;r.cooldown=Instant::now()+Duration::from_millis(1200);r.outside_since=None;r.hidden.take()});
-    if let (Some(w),Some((x,y)))=(app.get_webview_window("main"),pos){let _=w.set_position(PhysicalPosition::new(x,y));}
-    let _=sync_quick(app);
+    let pos=app.try_state::<Mutex<Runtime>>().and_then(|s|{let mut r=s.lock().ok()?;r.pending=None;r.sensor_armed=false;r.hidden.take()});
+    if let (Some(w),Some((x,y)))=(app.get_webview_window("main"),pos){
+        // 唤出时保留停靠方向，完整可见内容放回该显示器工作区；不可见缩放框允许在外侧。
+        let (x,y)=crate::window_native::geometry(&w).map(|g|{
+            let left=g.visible.left.clamp(g.work.left,(g.work.right-(g.visible.right-g.visible.left)).max(g.work.left));
+            let top=g.visible.top.clamp(g.work.top,(g.work.bottom-(g.visible.bottom-g.visible.top)).max(g.work.top));
+            (left-(g.visible.left-g.outer.left),top-(g.visible.top-g.outer.top))
+        }).unwrap_or((x,y));
+        let _=w.set_position(PhysicalPosition::new(x,y));let _=crate::window_native::show_no_activate(&w);
+    }
+    let _=sync_quick(app);reassert(app);
+}
+pub fn reassert(app:&tauri::AppHandle){
+    let value=app.try_state::<Mutex<Runtime>>().and_then(|s|s.lock().ok().map(|r|r.settings.always_on_top));
+    if let Some(v)=value{crate::window_native::repair(app,v);}
+}
+#[tauri::command]
+pub fn reveal_shell(app:tauri::AppHandle){restore(&app);}
+#[tauri::command]
+pub fn toggle_shell_maximize(app:tauri::AppHandle)->Result<bool,String>{
+    restore(&app);if let Some(s)=app.try_state::<Mutex<Runtime>>(){if let Ok(mut r)=s.lock(){r.pending=None;r.dock=None;}}
+    let w=app.get_webview_window("main").ok_or("主窗口不可用")?;
+    let result=crate::window_native::toggle_maximize(&w);reassert(&app);result
+}
+#[tauri::command]
+pub fn get_shell_diagnostics(app:tauri::AppHandle)->Result<serde_json::Value,String>{
+    let d=crate::window_native::drag();let state=app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化，请稍后重试")?;let r=state.lock().map_err(|_|"窗口状态不可用")?;
+    let geometry=app.get_webview_window("main").and_then(|w|crate::window_native::geometry(&w).ok());
+    Ok(serde_json::json!({"native":crate::window_native::snapshot(&app),"geometry":geometry,"maximized":geometry.is_some_and(|g|g.maximized),"desiredTopmost":r.settings.always_on_top,"hiddenEdge":if r.hidden.is_some(){r.dock.map(|d|d.edge)}else{None},"dockedEdge":r.dock.map(|d|d.edge),"sensor":r.dock.map(|d|d.sensor),"sensorArmed":r.sensor_armed,"dragSerial":d.serial,"dragging":d.dragging,"pending":r.pending.map(|p|p.0),"busy":r.busy,"layerRepairs":r.repairs}))
 }
 pub fn initialize(app:&tauri::AppHandle)->Result<(),String>{
     let raw:Option<String>={let db=app.state::<Database>();let c=db.0.lock().map_err(|_|"数据库暂不可用")?;c.query_row("SELECT value FROM app_settings WHERE key='window'",[],|r|r.get(0)).optional().map_err(|e|e.to_string())?};
@@ -80,24 +127,31 @@ pub fn initialize(app:&tauri::AppHandle)->Result<(),String>{
     main.set_position(PhysicalPosition::new(x,y)).map_err(|e|e.to_string())?;
     main.set_always_on_top(settings.always_on_top).map_err(|e|e.to_string())?;
     if let Some(q)=app.get_webview_window("quick"){q.set_always_on_top(settings.always_on_top).map_err(|e|e.to_string())?;}
+    // WebView 创建会泵送 IPC：先注册运行状态，避免界面已加载但状态尚未注册的竞态。
     persist(app,&settings)?;
-    app.manage(Mutex::new(Runtime{settings,hidden:None,busy:false,outside_since:None,cooldown:Instant::now()+Duration::from_secs(2),last_save:Instant::now()}));
+    app.manage(Mutex::new(Runtime{settings,hidden:None,dock:None,sensor_armed:false,busy:false,drag_serial:0,pending:None,last_save:Instant::now(),repairs:0}));
+    // 不再创建边缘把手 WebView；主窗口和快捷标签真正隐藏后，屏幕上不留任何标识。
+    crate::window_native::attach(&main)?;
+
+    reassert(app);
     let handle=app.clone();
-    std::thread::spawn(move || loop { std::thread::sleep(Duration::from_millis(180)); let a=handle.clone(); let _=handle.run_on_main_thread(move||tick(&a)); });
+    // 20 毫秒检测间隔避免旧的 100 毫秒轮询额外延长半秒隐藏等待。
+    std::thread::spawn(move || loop { std::thread::sleep(Duration::from_millis(20)); let a=handle.clone(); let _=handle.run_on_main_thread(move||tick(&a)); });
     Ok(())
 }
 #[tauri::command]
-pub fn get_shell_settings(app:tauri::AppHandle)->Result<Settings,String>{let mut s=app.state::<Mutex<Runtime>>().lock().map_err(|_|"窗口状态不可用")?.settings.clone();s.auto_start=autostart_actual();Ok(s)}
+pub fn get_shell_settings(app:tauri::AppHandle)->Result<Settings,String>{let mut s=app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化，请稍后重试")?.lock().map_err(|_|"窗口状态不可用")?.settings.clone();s.auto_start=autostart_actual();Ok(s)}
 #[tauri::command]
 pub fn set_shell_setting(app:tauri::AppHandle,key:String,value:bool)->Result<Settings,String>{
-    let mut s=app.state::<Mutex<Runtime>>().lock().map_err(|_|"窗口状态不可用")?.settings.clone();
+    let mut s=app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化，请稍后重试")?.lock().map_err(|_|"窗口状态不可用")?.settings.clone();
     match key.as_str(){
-        "alwaysOnTop"=>{for label in ["main","quick"]{if let Some(w)=app.get_webview_window(label){w.set_always_on_top(value).map_err(|e|e.to_string())?;}}s.always_on_top=value;},
-        "edgeHide"=>{restore(&app);s.edge_hide=value;},
+        "alwaysOnTop"=>{for label in ["main","quick","edge"]{if let Some(w)=app.get_webview_window(label){w.set_always_on_top(value).map_err(|e|e.to_string())?;}}s.always_on_top=value;},
+        "edgeHide"=>{restore(&app);if let Some(state)=app.try_state::<Mutex<Runtime>>(){if let Ok(mut r)=state.lock(){r.pending=None;r.dock=None;}}s.edge_hide=value;},
         "autoStart"=>{set_autostart(value)?;s.auto_start=value;},
         _=>return Err("未知窗口设置".into())
     }
-    s.error.clear();persist(&app,&s)?;app.state::<Mutex<Runtime>>().lock().map_err(|_|"窗口状态不可用")?.settings=s;
+    s.error.clear();persist(&app,&s)?;app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化，请稍后重试")?.lock().map_err(|_|"窗口状态不可用")?.settings=s;
+    for label in ["main","quick","edge"]{if key=="alwaysOnTop"{if let Some(w)=app.get_webview_window(label){crate::window_native::topmost(&w,value)?;}}}
     get_shell_settings(app)
 }
 #[tauri::command]
@@ -121,27 +175,83 @@ pub fn apply_backup_window(app:tauri::AppHandle,settings:serde_json::Value)->Res
     }Ok(())
 }
 
-fn contains(w:&tauri::WebviewWindow,p:&Point)->bool {if !w.is_visible().unwrap_or(false){return false;}w.outer_position().ok().zip(w.outer_size().ok()).is_some_and(|(a,b)|p.x>=a.x&&p.y>=a.y&&p.x<a.x+b.width as i32&&p.y<a.y+b.height as i32)}
 fn tick(app:&tauri::AppHandle){
     if let Some(instance)=app.try_state::<Instance>(){if unsafe{WaitForSingleObject(instance.event,0)}==0 {restore(app);crate::show_main(app);}}
     let Some(main)=app.get_webview_window("main")else{return};
-    if !main.is_visible().unwrap_or(false)||main.is_minimized().unwrap_or(false){return;}
-    let (Ok(pos),Ok(size),Ok(Some(monitor)))=(main.outer_position(),main.outer_size(),main.current_monitor())else{return};
+    let state=app.state::<Mutex<Runtime>>();
+    let value=state.lock().map(|r|r.settings.always_on_top).unwrap_or(false);
+    if crate::window_native::repair(app,value){if let Ok(mut r)=state.lock(){r.repairs+=1;}}
     let mut p=Point{x:0,y:0};if unsafe{GetCursorPos(&mut p)}==0{return;}
-    let mouse_down=unsafe{GetAsyncKeyState(1)}<0;
-    let over=contains(&main,&p)||app.get_webview_window("quick").is_some_and(|q|contains(&q,&p));
-    let state=app.state::<Mutex<Runtime>>();let Ok(mut r)=state.lock()else{return};
-    if r.hidden.is_some(){let reveal=over||!r.settings.edge_hide||r.busy;drop(r);if reveal{restore(app);}return;}
-    let a=monitor.work_area();let scale=monitor.scale_factor();let now=Instant::now();
-    if now.duration_since(r.last_save)>Duration::from_secs(2)&&!mouse_down {
-        r.last_save=now;let h=main.inner_size().map(|s|s.height as f64/scale).unwrap_or(720.0);
-        if r.settings.x!=Some(pos.x)||r.settings.y!=Some(pos.y)||(r.settings.height-h).abs()>1.0{r.settings.x=Some(pos.x);r.settings.y=Some(pos.y);r.settings.height=h;let copy=r.settings.clone();drop(r);if let Err(e)=persist(app,&copy){if let Ok(mut r)=state.lock(){r.settings.error=e;}}return;}
+    let d=crate::window_native::drag();let now=Instant::now();
+    let protected=crate::audio::active()||crate::audio::processing();
+    let Ok(mut r)=state.lock()else{return};
+    if r.hidden.is_some(){
+        let over=r.dock.is_some_and(|d|d.sensor.contains(p.x,p.y));
+        // 隐藏后必须先离开原感应区再进入，防止光标未动就不断隐藏/弹出。
+        if !over{r.sensor_armed=true;}
+        let reveal=(over&&r.sensor_armed)||!r.settings.edge_hide||r.busy||protected;
+        drop(r);if reveal{restore(app);}return;
     }
-    if !r.settings.edge_hide||r.busy||mouse_down||over||now<r.cooldown {r.outside_since=None;return;}
-    let start=*r.outside_since.get_or_insert(now);if now.duration_since(start)<Duration::from_millis(900){return;}
-    let threshold=(12.0*scale)as i32;let strip=(6.0*scale)as i32;
-    let target=if (pos.x-a.position.x).abs()<=threshold{Some((a.position.x-size.width as i32+strip,pos.y))}
-        else if (a.position.x+a.size.width as i32-pos.x-size.width as i32).abs()<=threshold{Some((a.position.x+a.size.width as i32-strip,pos.y))}
-        else if (pos.y-a.position.y).abs()<=threshold{Some((pos.x,a.position.y-size.height as i32+strip))}else{None};
-    if let Some((x,y))=target{r.hidden=Some((pos.x,pos.y));drop(r);if let Some(q)=app.get_webview_window("quick"){let _=q.hide();}if main.set_position(PhysicalPosition::new(x,y)).is_err(){restore(app);}}
+    if !main.is_visible().unwrap_or(false)||main.is_minimized().unwrap_or(false){r.pending=None;return;}
+    let Ok(g)=crate::window_native::geometry(&main)else{r.pending=None;return};
+    // 最大化天然接触多条边，不能参与停靠或覆盖普通窗口的恢复位置。
+    if g.maximized{r.pending=None;r.dock=None;r.drag_serial=d.serial;return;}
+    // 重拖立即取消旧计时。仅处理新一轮 WM_EXITSIZEMOVE，程序移动不触发隐藏。
+    if d.dragging{r.pending=None;r.dock=None;return;}
+    if d.serial!=r.drag_serial{
+        r.drag_serial=d.serial;r.pending=None;
+        r.dock=None;
+        if r.settings.edge_hide&&!r.busy&&!protected{
+            if let Some(released)=d.released{if let Some(edge)=contact(g.visible,g.screen,d.dx,d.dy){
+                r.dock=Some(Dock{edge,sensor:sensor(edge,g.visible,g.screen)});r.pending=Some((edge,released,d.serial,false));
+            }}
+        }
+    }
+    if !r.settings.edge_hide{r.pending=None;r.dock=None;}
+    if r.busy||protected||unsafe{GetAsyncKeyState(1)}<0{r.pending=None;return;}
+    if let Some(dock)=r.dock{
+        if g.visible.contains(p.x,p.y){
+            // 回到窗口内只取消“离开后”的计时，不取消首次拖动松手的计时。
+            if r.pending.is_some_and(|p|p.3){r.pending=None;}
+        }else if let Some(p)=r.pending.as_mut(){
+            // 首次松手后若光标曾离开，返回窗口也应取消原计时；不重置开始时间。
+            p.3=true;
+        }else{r.pending=Some((dock.edge,now,d.serial,true));}
+    }
+    if let Some((_,released,serial,_))=r.pending{
+        // 三个方向、首次松手与唤出后离开共用唯一的 500 毫秒期限。
+        if now.duration_since(released)>=Duration::from_millis(500)&&serial==d.serial{
+            r.pending=None;r.hidden=Some((g.outer.left,g.outer.top));r.sensor_armed=!r.dock.is_some_and(|d|d.sensor.contains(p.x,p.y));drop(r);
+            // 真正隐藏而不移到相邻显示器；没有任何边缘窗口、残片或色条。
+            if let Some(q)=app.get_webview_window("quick"){let _=crate::window_native::hide(&q);}
+            let result=crate::window_native::hide(&main);
+            if let Err(e)=result{restore(app);if let Ok(mut r)=state.lock(){r.settings.error=e.to_string();}}return;
+        }
+    }
+    if now.duration_since(r.last_save)>Duration::from_secs(2)&&unsafe{GetAsyncKeyState(1)}>=0{
+        r.last_save=now;let scale=main.scale_factor().unwrap_or(1.0);let h=main.inner_size().map(|s|s.height as f64/scale).unwrap_or(720.0);
+        if r.settings.x!=Some(g.outer.left)||r.settings.y!=Some(g.outer.top)||(r.settings.height-h).abs()>1.0{r.settings.x=Some(g.outer.left);r.settings.y=Some(g.outer.top);r.settings.height=h;let copy=r.settings.clone();drop(r);if let Err(e)=persist(app,&copy){if let Ok(mut r)=state.lock(){r.settings.error=e;}}}
+    }
+}
+#[cfg(test)]mod tests{
+ use super::*;
+ fn b(left:i32,top:i32,right:i32,bottom:i32)->Bounds{Bounds{left,top,right,bottom}}
+ #[test]fn actual_visible_contact_only(){let s=b(0,0,1000,1000);
+  assert_eq!(contact(b(20,20,420,700),s,-500,0),None);
+  assert_eq!(contact(b(0,20,400,700),s,-500,0),Some(Edge::Left));
+  assert_eq!(contact(b(600,20,1000,700),s,500,0),Some(Edge::Right));
+  assert_eq!(contact(b(300,0,700,700),s,0,-500),Some(Edge::Top));
+  assert_eq!(contact(b(300,300,700,1000),s,0,500),None);
+  assert_eq!(contact(b(2,20,402,700),s,-500,0),None);
+  assert_eq!(contact(b(1,20,401,700),s,-500,0),Some(Edge::Left));
+ }
+ #[test]fn corner_follows_drag_direction(){let s=b(0,0,1000,1000);let v=b(-10,-10,400,700);
+  assert_eq!(contact(v,s,-400,-20),Some(Edge::Left));assert_eq!(contact(v,s,-20,-400),Some(Edge::Top));
+  assert_eq!(contact(b(600,-10,1010,700),s,400,-20),Some(Edge::Right));
+ }
+ #[test]fn negative_screen_and_limited_sensor(){let s=b(-1920,-300,0,780);let v=b(-1920,20,-1400,700);
+  assert_eq!(contact(v,s,-500,0),Some(Edge::Left));let z=sensor(Edge::Left,v,s);
+  assert!(z.contains(-1920,200));assert!(!z.contains(-1920,0));assert!(!z.contains(-1917,200));
+  assert_eq!(contact(b(1922,100,2500,1000),b(1920,0,5760,2160),-400,0),None);
+ }
 }

@@ -1,20 +1,23 @@
 use crate::database::Database;
 use serde_json::{json,Value};
 use rusqlite::{params,OptionalExtension};
-use std::{path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering}};
+use std::{path::{Path,PathBuf},sync::{atomic::{AtomicBool,Ordering},Mutex}};
 use tauri::Manager;
 
 fn err(e:impl std::fmt::Display)->String{e.to_string()}
 static PROCESSING:AtomicBool=AtomicBool::new(false);
+static PROCESSING_SINCE:Mutex<Option<String>>=Mutex::new(None);
+static LAST_PROCESSING:Mutex<Option<(String,String)>>=Mutex::new(None);
 pub fn processing()->bool{PROCESSING.load(Ordering::Relaxed)}
 pub(crate) struct ProcessingGuard;
-impl ProcessingGuard { pub fn acquire()->Result<Self,String>{if PROCESSING.swap(true,Ordering::SeqCst){Err("已有音频任务正在处理，请稍候".into())}else{Ok(Self)}} }
-impl Drop for ProcessingGuard{fn drop(&mut self){PROCESSING.store(false,Ordering::Relaxed);}}
+impl ProcessingGuard { pub fn acquire()->Result<Self,String>{if PROCESSING.swap(true,Ordering::SeqCst){Err("已有音频任务正在处理，请稍候".into())}else{if let Ok(mut since)=PROCESSING_SINCE.lock(){*since=Some(chrono::Utc::now().to_rfc3339());}Ok(Self)}} }
+impl Drop for ProcessingGuard{fn drop(&mut self){if let Ok(mut since)=PROCESSING_SINCE.lock(){if let Some(start)=since.take(){if let Ok(mut last)=LAST_PROCESSING.lock(){*last=Some((start,chrono::Utc::now().to_rfc3339()));}}}PROCESSING.store(false,Ordering::SeqCst);}}
+pub fn task_snapshot()->Value{let since=PROCESSING_SINCE.lock().ok().and_then(|s|s.clone());let last=LAST_PROCESSING.lock().ok().and_then(|s|s.clone());json!({"kind":"audio_processing","label":"录音或转写处理","status":if processing(){"running"}else if last.is_some(){"finished"}else{"idle"},"startedAt":since.or_else(||last.as_ref().map(|s|s.0.clone())),"endedAt":last.map(|s|s.1),"canCancel":false})}
 pub fn active()->bool{crate::recording_capture::active()}
 pub fn setting(app:&tauri::AppHandle,key:&str)->Result<Value,String>{let db=app.state::<Database>();let c=db.0.lock().map_err(err)?;let raw:Option<String>=c.query_row("SELECT value FROM app_settings WHERE key=?1",[key],|r|r.get(0)).optional().map_err(err)?;raw.map(|s|serde_json::from_str(&s).map_err(err)).unwrap_or(Ok(json!({})))}
 pub fn save_setting(app:&tauri::AppHandle,key:&str,v:&Value)->Result<(),String>{app.state::<Database>().0.lock().map_err(err)?.execute("INSERT INTO app_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,serde_json::to_string(v).map_err(err)?]).map_err(err)?;Ok(())}
 fn non_c(p:&Path)->Result<(),String>{if !p.is_absolute()||p.to_string_lossy().to_ascii_lowercase().starts_with("c:"){return Err("请选择非 C 盘绝对路径".into());}Ok(())}
-#[tauri::command]pub fn audio_config(app:tauri::AppHandle)->Result<Value,String>{let mut v=setting(&app,"audio_config")?;if v.get("root").is_none(){v=json!({"root":""});}let previous=v.clone();crate::sensevoice::defaults(&mut v);if v!=previous{save_setting(&app,"audio_config",&v)?;}v.as_object_mut().map(|o|o.remove("validation"));v["available"]=json!(crate::sensevoice::available(&v));let checked=setting(&app,"audio_validation")?;if checked["fingerprint"]==json!(local_fingerprint(&v)){v["validation"]=checked;}v["installation"]=setting(&app,"sensevoice_install")?;v["processing"]=json!(processing());Ok(v)}
+#[tauri::command]pub fn audio_config(app:tauri::AppHandle)->Result<Value,String>{let mut v=setting(&app,"audio_config")?;if v["root"].as_str().is_none_or(str::is_empty){v["root"]=json!(app.state::<crate::data_root::DataRoot>().0.join("voice"));}let previous=v.clone();crate::sensevoice::defaults(&mut v);if v!=previous{save_setting(&app,"audio_config",&v)?;}v.as_object_mut().map(|o|o.remove("validation"));v["available"]=json!(crate::sensevoice::available(&v));let checked=setting(&app,"audio_validation")?;if checked["fingerprint"]==json!(local_fingerprint(&v)){v["validation"]=checked;}v["installation"]=setting(&app,"sensevoice_install")?;v["processing"]=json!(processing());Ok(v)}
 #[tauri::command]pub fn save_audio_config(config:Value,app:tauri::AppHandle)->Result<Value,String>{if active()||processing(){return Err("请先停止录音或等待模型任务完成，再修改路径".into());}let mut v=json!({});for k in ["root","sensePython","senseRuntime","senseModels"]{let s=config[k].as_str().unwrap_or("");if !s.is_empty(){non_c(Path::new(s))?;}v[k]=json!(s);}if v["root"]==""{return Err("请选择音频与模型保存目录".into());}// 兼容旧备份的引擎字段，统一迁移到 SenseVoice，保留录音和历史版本。
 v["engine"]=json!("sensevoice");for k in ["sensePython","senseRuntime","senseModels"]{if v[k]==""{v.as_object_mut().unwrap().remove(k);}}crate::sensevoice::defaults(&mut v);save_setting(&app,"audio_config",&v)?;audio_config(app)}
 #[tauri::command]pub async fn choose_audio_path(kind:String)->Result<Option<String>,String>{tauri::async_runtime::spawn_blocking(move||{let d=rfd::FileDialog::new();let p=match kind.as_str(){"root"|"senseRuntime"|"senseModels"=>d.pick_folder(),"sensePython"=>d.add_filter("运行程序",&["exe"]).pick_file(),_=>return Err("不支持的路径类型".into())};if let Some(p)=p{non_c(&p)?;Ok(Some(p.to_string_lossy().to_string()))}else{Ok(None)}}).await.map_err(err)?}

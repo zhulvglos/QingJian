@@ -3,7 +3,7 @@ use rusqlite::{Connection, types::{Value as SqlValue, ValueRef}, params_from_ite
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, HashSet}, path::{Path, PathBuf}};
+use std::{collections::{BTreeMap, HashSet}, path::Path};
 use tauri::{Manager, Emitter};
 
 const TABLES: [(&str,&str);4]=[
@@ -76,6 +76,13 @@ fn write(path:&Path,b:&Backup)->Result<(),String>{
     let result=(||{use std::io::Write;let mut f=std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(err)?;f.write_all(&serde_json::to_vec_pretty(b).map_err(err)?).map_err(err)?;f.sync_all().map_err(err)?;drop(f);std::fs::rename(&tmp,path).map_err(|e|format!("写入备份失败（请选择新文件名）：{e}"))})();
     if result.is_err(){let _=std::fs::remove_file(&tmp);}result
 }
+// 普通文档导入只复用内容快照，不接入备份恢复的外部 ID 或冲突覆盖流程。
+pub(crate) fn before_document_import(conn:&Connection,preferences:Value,root:&Path)->Result<std::path::PathBuf,String>{
+    let before=snapshot(conn,preferences)?;
+    let dir=root.join("backups");std::fs::create_dir_all(&dir).map_err(err)?;
+    let path=dir.join(format!("文档导入前-{}.qjbackup",uuid::Uuid::new_v4()));
+    write(&path,&before)?;Ok(path)
+}
 #[tauri::command]
 pub async fn choose_backup_path(save:bool)->Result<Option<String>,String>{
     tauri::async_runtime::spawn_blocking(move||{let d=rfd::FileDialog::new().add_filter("轻笺备份",&["qjbackup"]);let p=if save{d.set_file_name(format!("轻笺备份-{}.qjbackup",chrono::Local::now().format("%Y%m%d-%H%M%S"))).save_file()}else{d.pick_file()};p.map(|p|p.to_string_lossy().to_string())}).await.map_err(err)
@@ -124,7 +131,7 @@ pub fn import_backup(path:String,expected_checksum:String,policy:String,preferen
     let mut b=read(&path)?;if b.checksum!=expected_checksum{return Err("文件在预览后发生变化，请重新预览".into());}select_items(&mut b,selected_ids)?;
     let db=app.state::<Database>();let mut conn=db.0.lock().map_err(err)?;
     let before=snapshot(&conn,preferences)?;
-    let dir=PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法定位用户目录")?).join("SHUSHIN/Qingjian/backups");std::fs::create_dir_all(&dir).map_err(err)?;
+    let dir=app.state::<crate::data_root::DataRoot>().0.join("backups");std::fs::create_dir_all(&dir).map_err(err)?;
     let backup=dir.join(format!("导入前-{}.qjbackup",uuid::Uuid::new_v4()));write(&backup,&before)?;
     let count=merge(&mut conn,&b,&policy)?;drop(conn);
     let _=app.emit_to("quick","quick-items-changed",true);
