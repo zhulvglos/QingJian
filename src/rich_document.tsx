@@ -1,21 +1,26 @@
-import { useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import type { JSONContent } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { TaskItem, TaskList } from '@tiptap/extension-list';
+import {TaskIdentity,identifyDocument} from './task_identity';
+import {NavIcon} from './ui_icons';
+import {formatParagraphs} from './list_format';
+import {BodyViewFilter,bodyViewKey,type BodyView} from './body_view';
 
 type Mode = 'paragraph' | 'checklist';
 type StoredDocument = { format: 'qingjian-rich-v1'; mode: Mode; document: JSONContent; checks: boolean[] };
 
-// 提醒视图仅展示数据库快照，不注册编辑回调；切换记录时由父组件的 key 重建。
-export function ReadOnlyBody({body, bodyJson}: {body: string; bodyJson: string | null}) {
-  const editor = useEditor({
-    extensions: [StarterKit, TaskList, TaskItem.configure({nested: true})],
-    content: readDocument(body, bodyJson).document,
-    editable: false,
-  });
-  return <div className="rich-body readonly-body"><EditorContent className="rich-editor" editor={editor} aria-label="已保存正文，只读" /></div>;
+// 四个模式由工作区统一控制；提醒时仅保留内存编辑器，正文 DOM 不渲染。
+export function BodyViewTools({mode,onMode}: {mode:BodyView;onMode:(mode:BodyView)=>void}) {
+  return <div className="detail-tools view-tools" role="toolbar" aria-label="正文查看" onMouseDown={e=>e.preventDefault()}>{(['all','checked','unchecked','reminder'] as const).map((value,index)=><button key={value} type="button" className={'tool-icon '+(mode===value?'active':'')} title={['全部内容','已勾选','未勾选','提醒'][index]} aria-label={['全部内容','已勾选','未勾选','提醒'][index]} aria-pressed={mode===value} onClick={()=>onMode(value)}>{value==='all'?<NavIcon name="all"/>:value==='reminder'?<NavIcon name="bell"/>:checkIcon(value==='checked')}</button>)}</div>;
+}
+export function ReadOnlyBody({body,bodyJson,mode}: {body:string;bodyJson:string|null;mode:BodyView}) {
+  const editor=useEditor({extensions:[StarterKit,TaskIdentity,BodyViewFilter,TaskList,TaskItem.configure({nested:true})],content:identifyDocument(readDocument(body,bodyJson).document),editable:false});
+  useLayoutEffect(()=>{if(editor)editor.view.dispatch(editor.state.tr.setMeta(bodyViewKey,mode));},[editor,mode]);
+  const count=taskEntries(body,bodyJson).filter(t=>t.checked===(mode==='checked')).length;
+  if(mode==='reminder')return null;
+  return <div className="rich-body readonly-body">{mode!=='all'&&!count&&<p className="body-view-empty">暂无{mode==='checked'?'已勾选':'未勾选'}内容</p>}<EditorContent className="rich-editor" editor={editor} aria-label="已保存正文，只读" /></div>;
 }
 
 function paragraph(content?: JSONContent[]): JSONContent {
@@ -72,13 +77,9 @@ export function documentText(document: JSONContent): string {
 
 export function taskEntries(body: string, bodyJson?: string | null): { text: string; checked: boolean; index: number }[] {
   const stored = readDocument(body, bodyJson);
-  if (stored.mode === 'checklist') {
-    return (stored.document.content ?? []).flatMap((node) => node.type === 'taskList' ? (node.content ?? []).map((item) => ({
-      text: (item.content ?? []).map(inlineText).join('\n').trim(),
-      checked: item.attrs?.checked === true,
-      index: 0,
-    })) : []).map((entry, index) => ({ ...entry, index })).filter((entry) => entry.text.length > 0);
-  }
+  const entries:{text:string;checked:boolean;index:number}[]=[];
+  const walk=(node:JSONContent)=>{if(node.type==='taskItem'){const text=(node.content||[]).filter(n=>n.type!=='taskList').map(inlineText).join('\n').trim();if(text)entries.push({text,checked:node.attrs?.checked===true,index:entries.length});}for(const child of node.content||[])walk(child);};walk(stored.document);
+  if(entries.length)return entries;
   // 兼容旧纯文本中已有的行首待办标记；普通段落不会被误当成任务。
   return body.split('\n').flatMap((line, index) => /^[☐☑]/.test(line) ? [{ text: line.slice(1).trim(), checked: line[0] === '☑', index }] : []);
 }
@@ -88,61 +89,28 @@ function taskItem(block: JSONContent, checked: boolean): JSONContent {
   return { type: 'taskItem', attrs: { checked }, content };
 }
 
-function asChecklist(document: JSONContent, checks: boolean[]): JSONContent {
-  const items: JSONContent[] = [];
-  for (const block of document.content ?? []) {
-    if (block.type === 'taskList') {
-      items.push(...(block.content ?? []));
-    } else {
-      items.push(taskItem(block, checks[items.length] ?? false));
-    }
-  }
-  if (!items.length) items.push(taskItem(paragraph(), false));
-  return { type: 'doc', content: [{ type: 'taskList', content: items }] };
-}
-
-function asParagraphs(document: JSONContent): { document: JSONContent; checks: boolean[] } {
-  const blocks: JSONContent[] = [];
-  const checks: boolean[] = [];
-  for (const block of document.content ?? []) {
-    if (block.type === 'taskList') {
-      for (const item of block.content ?? []) {
-        checks.push(item.attrs?.checked === true);
-        blocks.push(...(item.content?.length ? item.content : [paragraph()]));
-      }
-    } else {
-      blocks.push(block);
-      checks.push(false);
-    }
-  }
-  return { document: { type: 'doc', content: blocks.length ? blocks : [paragraph()] }, checks };
-}
-
 function listIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="4" cy="5" r="1.2" fill="currentColor"/><circle cx="4" cy="12" r="1.2" fill="currentColor"/><circle cx="4" cy="19" r="1.2" fill="currentColor"/><path d="M8 5h13M8 12h13M8 19h13" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>;
-}
-
-function singleListIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="8" width="5" height="5" rx="1" fill="none" stroke="currentColor" strokeWidth="1.5"/><path d="M10 10.5h11" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>;
 }
 
 function checkIcon(checked: boolean) {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" fill={checked ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.6"/>{checked && <path d="m7 12 3.2 3.2L17 8" fill="none" stroke="var(--surface)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>}</svg>;
 }
 
-export function RichBodyEditor({ body, bodyJson, onChange, toolsTarget }: { body: string; bodyJson?: string | null; onChange: (body: string, bodyJson: string) => void; toolsTarget: HTMLElement | null }) {
+export function RichBodyEditor({ body, bodyJson, onChange, mode:filter }: { body: string; bodyJson?: string | null; onChange: (body: string, bodyJson: string) => void; mode:BodyView }) {
   const initial = useRef(readDocument(body, bodyJson)).current;
   const checksRef = useRef(initial.checks);
-  const [filter, setFilter] = useState<'all' | 'checked' | 'unchecked'>('all');
+  const [editorFocused,setEditorFocused]=useState(false);
   const callbackRef = useRef(onChange);
   callbackRef.current = onChange;
 
   const editor = useEditor({
     // 避免编辑器在列表尾部自动补段落，反复转换时累积空白勾选项。
-    extensions: [StarterKit.configure({ trailingNode: false }), TaskList, TaskItem.configure({
+    extensions: [StarterKit.configure({ trailingNode: false }), TaskIdentity, BodyViewFilter, TaskList, TaskItem.configure({
       a11y: { checkboxLabel: (_node, checked) => checked ? '标记为未完成' : '标记为完成' },
     })],
-    content: initial.document,
+    content: identifyDocument(initial.document),
+    onFocus:()=>setEditorFocused(true),onBlur:()=>setEditorFocused(false),
     onUpdate: ({ editor: current }) => {
       const document = current.getJSON();
       checksRef.current = (document.content ?? []).flatMap((node) => node.type === 'taskList' ? (node.content ?? []).map((item) => (item as JSONContent).attrs?.checked === true) : []);
@@ -151,37 +119,32 @@ export function RichBodyEditor({ body, bodyJson, onChange, toolsTarget }: { body
     },
   });
 
-  const convertAll = () => {
-    if (!editor) return;
-    const document = editor.getJSON();
-    // 编辑器自动附加的尾部空段落不改变“全文已是勾选列表”的判断。
-    const meaningful = (document.content ?? []).filter((node) => !(node.type === 'paragraph' && !node.content?.length));
-    const allTasks = meaningful.length > 0 && meaningful.every((node) => node.type === 'taskList');
-    const next = allTasks ? asParagraphs(document).document : asChecklist(document, []);
-    setFilter('all');
-    editor.commands.setContent(next, { emitUpdate: true });
-    editor.commands.focus();
+  const [notice,setNotice]=useState('');
+  useLayoutEffect(()=>{if(editor)editor.view.dispatch(editor.state.tr.setMeta(bodyViewKey,filter));},[editor,filter]);
+  const prepare=()=>setNotice('');
+  const convertAll=()=>{if(!editor)return;prepare();const document=editor.getJSON() as JSONContent;let skipped=false;
+    const content:JSONContent[]=[];
+    for(const block of document.content||[]){if(block.type==='paragraph'){content.push({type:'taskList',content:[taskItem(block,block.attrs?.qjChecked===true)]});}
+      else if(block.type==='taskList')content.push(block);
+      else if(['bulletList','orderedList'].includes(block.type||'')&&block.content?.every(i=>i.content?.length===1&&i.content[0].type==='paragraph'))content.push({type:'taskList',content:block.content.map(i=>taskItem(i.content![0],i.content![0].attrs?.qjChecked===true))});
+      else{content.push(block);skipped=true;}}
+    if(JSON.stringify(content)!==JSON.stringify(document.content))editor.commands.setContent({...document,content},{emitUpdate:true});
+    if(skipped)setNotice('标题和复杂结构保持原样。');editor.commands.focus();
   };
-
-  const convertCurrent = () => {
-    if (!editor) return;
-    // 折叠到原光标段落，已有任务仅提起当前项，不解除同组其他项。
-    const at = editor.state.selection.head;
-    setFilter('all');
-    const chain = editor.chain().focus().setTextSelection(at);
-    if (editor.isActive('taskItem')) chain.liftListItem('taskItem').run();
-    else chain.toggleTaskList().run();
-  };
-
-  const tools = <div className="detail-tools" role="toolbar" aria-label="正文操作" onMouseDown={(event) => event.preventDefault()}>
-    <button type="button" className={'tool-icon ' + (filter === 'checked' ? 'active' : '')} onClick={() => setFilter(filter === 'checked' ? 'all' : 'checked')} title="只显示已勾选条目；再次点击显示全部" aria-label="只显示已勾选条目" aria-pressed={filter === 'checked'}>{checkIcon(true)}</button>
-    <button type="button" className={'tool-icon ' + (filter === 'unchecked' ? 'active' : '')} onClick={() => setFilter(filter === 'unchecked' ? 'all' : 'unchecked')} title="只显示未勾选条目；再次点击显示全部" aria-label="只显示未勾选条目" aria-pressed={filter === 'unchecked'}>{checkIcon(false)}</button>
-    <button type="button" className="tool-icon" onClick={convertAll} title="全文：勾选列表 / 普通段落" aria-label="切换全文勾选列表">{listIcon()}</button>
-    <button type="button" className="tool-icon" onClick={convertCurrent} title="当前段落：勾选条目 / 普通段落" aria-label="切换当前段落勾选条目">{singleListIcon()}</button>
-  </div>;
-
+  const applySelected=(target:'taskList'|'orderedList'|'bulletList',single=false)=>{if(!editor)return;prepare();const {from,to,$head}=editor.state.selection;const ids=new Set<string>();if(single){if($head.parent.type.name==='paragraph')ids.add($head.parent.attrs.qjId);}else{editor.state.doc.nodesBetween(from,to,(n)=>{if(n.type.name==='paragraph')ids.add(n.attrs.qjId);});if(from===to&&$head.parent.type.name==='paragraph')ids.add($head.parent.attrs.qjId);}if(!ids.size){setNotice('请在普通段落中设置格式，复杂结构保持原样。');return;}const next=formatParagraphs(editor.getJSON() as JSONContent,ids,target);if(JSON.stringify(next.document)!==JSON.stringify(editor.getJSON()))editor.commands.setContent(next.document,{emitUpdate:true});if(next.skipped)setNotice('复杂结构保持原样。');editor.chain().focus().setTextSelection(Math.min(from,editor.state.doc.content.size-1)).run();};
+  const convertCurrent=()=>applySelected('taskList',true);
+  const format=(kind:'ordered'|'bullet'|'bold')=>{if(!editor)return;if(kind==='bold'){prepare();editor.chain().focus().toggleBold().run();}else applySelected(kind==='ordered'?'orderedList':'bulletList');};
+  const count=taskEntries(body,bodyJson).filter(t=>t.checked===(filter==='checked')).length;
+  if(filter==='reminder')return null;
   return <div className="rich-body">
-    {toolsTarget && createPortal(tools, toolsTarget)}
-    <EditorContent className={'rich-editor filter-' + filter} editor={editor} aria-label="正文" />
+    {filter!=='all'&&!count&&<p className="body-view-empty">暂无{filter==='checked'?'已勾选':'未勾选'}内容</p>}
+    <div className="body-content-card"><div className="body-format-tools" role="toolbar" aria-label="正文格式" onMouseDown={e=>e.preventDefault()}>
+      <button className="tool-icon" title="全文添加勾选框" aria-label="全文添加勾选框" disabled={filter!=='all'} onClick={convertAll}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h4v4H3zM3 14h4v4H3zM11 6h10M11 16h10"/></svg></button>
+      <button className="tool-icon" title="当前段落添加勾选框" aria-label="当前段落添加勾选框" disabled={!editorFocused} onClick={convertCurrent}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h5v5H3zM12 11h9"/></svg></button>
+      <button className="tool-icon" title="自动序号列表" aria-label="自动序号列表" disabled={!editorFocused} aria-pressed={editor?.isActive('orderedList')} onClick={()=>format('ordered')}><svg viewBox="0 0 24 24" aria-hidden="true"><text x="1" y="9">1</text><text x="1" y="20">2</text><path d="M10 6h11M10 17h11"/></svg></button>
+      <button className="tool-icon" title="自动无序列表" aria-label="自动无序列表" disabled={!editorFocused} aria-pressed={editor?.isActive('bulletList')} onClick={()=>format('bullet')}>{listIcon()}</button>
+      <button className="tool-icon" title="加粗" aria-label="加粗" disabled={!editorFocused} aria-pressed={editor?.isActive('bold')} onClick={()=>format('bold')}><strong>B</strong></button>
+    </div>{notice&&<small role="status">{notice}</small>}
+    <EditorContent className="rich-editor" editor={editor} aria-label="正文" /></div>
   </div>;
 }

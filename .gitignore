@@ -14,3 +14,9 @@ src-tauri/gen/
 *.key
 *.pfx
 *.p12
+
+# 本机维护与桌面验收脚本含安装路径，不属于跨机器源码交付。
+/scripts/
+*.exe
+*.msi
+*.qjbackup

@@ -1,3 +1,4 @@
+import {NewsCollection} from './news_collection';
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -18,7 +19,7 @@ function fetchDaily(){
   })().finally(()=>{pending=null;});
   return pending;
 }
-export function NewsPanel(){
+export function NewsPanel({onView}:{onView:(id:string)=>void}){
   const [daily,setDaily]=useState<NewsFeed|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
   const [cacheError,setCacheError]=useState('');
   const [feedback,setFeedback]=useState(refreshFeedback);
@@ -47,11 +48,11 @@ export function NewsPanel(){
     {!error&&feedback&&<p className="news-meta" role="status">{feedback}</p>}
     {daily&&active?<><div className="news-meta">{daily.source==='AIHOT 精选'?'AIHOT 精选':'AIHOT 旧缓存'} · {daily.date||'来源未提供日期'}</div>
       {daily.source!=='AIHOT 精选'&&<p className="news-meta">点击刷新，获取最新精选。</p>}
-      <SplitView storageKey="news" list={<div role="listbox" aria-label="新闻标题列表" tabIndex={0} onKeyDown={e=>{
+      <SplitView storageKey="news" list={<><NewsCollection source="news" rows={daily.items} selected={active.id} onView={onView}/><div role="listbox" aria-label="新闻标题列表" tabIndex={0} onKeyDown={e=>{
         if(!['ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();
         // 仅列表内处理方向键，选中后同步焦点与滚动，不影响其他输入控件。
         const index=daily.items.findIndex(i=>i.id===active.id);const next=Math.max(0,Math.min(daily.items.length-1,index+(e.key==='ArrowDown'?1:-1)));
         setSelected(daily.items[next].id);const card=e.currentTarget.querySelectorAll<HTMLButtonElement>('.news-title-card')[next];card?.focus({preventScroll:true});card?.scrollIntoView({block:'nearest'});
-      }}>{daily.items.map(item=><button role="option" tabIndex={active.id===item.id?0:-1} className={'news-title-card '+(active.id===item.id?'selected':'')} key={item.id} aria-selected={active.id===item.id} onClick={()=>setSelected(item.id)}>{item.title}{(item.timelineAt||item.publishedAt)&&<small>{new Date(item.timelineAt||item.publishedAt!).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}</small>}</button>)}</div>} detail={<article className="news-card"><small>{active.category}{active.publishedAt&&<> · 原文发布时间 {new Date(active.publishedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}</>}</small><h2>{active.title}</h2><p>{active.summary||'来源未提供摘要'}</p><footer><span>{active.source||'来源未提供'}</span>{active.permalink&&<button onClick={()=>void invoke('open_news_link',{url:active.permalink}).catch(e=>setError(String(e)))}>站内阅读</button>}{active.sourceUrl&&<button onClick={()=>void invoke('open_news_link',{url:active.sourceUrl}).catch(e=>setError(String(e)))}>原文</button>}</footer></article>}/></>:<p className="news-meta">暂无新闻内容。可点击刷新。</p>}
+      }}>{daily.items.map(item=><button role="option" tabIndex={active.id===item.id?0:-1} className={'news-title-card '+(active.id===item.id?'selected':'')} key={item.id} aria-selected={active.id===item.id} onClick={()=>setSelected(item.id)}>{item.title}{(item.timelineAt||item.publishedAt)&&<small>{new Date(item.timelineAt||item.publishedAt!).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}</small>}</button>)}</div></>} detail={<article className="news-card"><small>{active.category}{active.publishedAt&&<> · 原文发布时间 {new Date(active.publishedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}</>}</small><h2>{active.title}</h2><p>{active.summary||'来源未提供摘要'}</p><footer><span>{active.source||'来源未提供'}</span>{active.permalink&&<button onClick={()=>void invoke('open_news_link',{url:active.permalink}).catch(e=>setError(String(e)))}>站内阅读</button>}{active.sourceUrl&&<button onClick={()=>void invoke('open_news_link',{url:active.sourceUrl}).catch(e=>setError(String(e)))}>原文</button>}</footer></article>}/></>:<p className="news-meta">暂无新闻内容。可点击刷新。</p>}
   </div>;
 }

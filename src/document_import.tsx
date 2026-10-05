@@ -1,6 +1,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {invoke} from '@tauri-apps/api/core';
 import type {ItemKind} from './item_workspace';
+import {BackupRestoreDialog} from './backup_restore';
 type Entry={id:string;title:string;bodyPreview:string;previewTruncated:boolean;error:string|null};
 type FilePreview={id:string;fileName:string;format:string;entries:Entry[];warnings:string[];error:string|null;fields:string[];canMap:boolean;canAsText:boolean};
 type Preview={requestId:string;files:FilePreview[]};
@@ -10,15 +11,19 @@ export type DocumentImportResult={items:{id:string;kind:ItemKind}[];sticky:numbe
 type Props={defaultKind:ItemKind;preferences:{theme:string;fontSize:string};onClose:()=>void;onImported:()=>Promise<void>;onView:(id:string)=>void;onSaving:(busy:boolean)=>void};
 
 export function DocumentImportDialog({defaultKind,preferences,onClose,onImported,onView,onSaving}:Props){
+ const [backups,setBackups]=useState<string[]>([]);
+ const [backupBusy,setBackupBusy]=useState(false);
+ useEffect(()=>{const busy=(e:Event)=>setBackupBusy((e as CustomEvent<boolean>).detail);window.addEventListener('backup-saving',busy);return()=>window.removeEventListener('backup-saving',busy);},[]);
  const [preview,setPreview]=useState<Preview|null>(null),[choices,setChoices]=useState<Record<string,Choice>>({}),[mappings,setMappings]=useState<Record<string,Mapping>>({});
  const [target,setTarget]=useState(defaultKind),[phase,setPhase]=useState<'pick'|'choosing'|'parsing'|'mapping'|'preview'|'saving'|'done'>('pick');
  const [error,setError]=useState(''),[partialAccepted,setPartialAccepted]=useState(false),[result,setResult]=useState<DocumentImportResult|null>(null);
  const request=useRef<string|null>(null),alive=useRef(true),dialog=useRef<HTMLElement>(null),closeRef=useRef<()=>void>(()=>{});
  const busy=['choosing','parsing','mapping','saving'].includes(phase);
- const close=()=>{if(phase==='saving')return;alive.current=false;const id=request.current;request.current=null;if(id)void invoke('cancel_document_import',{requestId:id}).catch(()=>{});onClose();};closeRef.current=close;
+ const close=()=>{if(phase==='saving'||backupBusy)return;alive.current=false;const id=request.current;request.current=null;if(id)void invoke('cancel_document_import',{requestId:id}).catch(()=>{});onClose();};closeRef.current=close;
  useEffect(()=>{
   alive.current=true;dialog.current?.querySelector<HTMLButtonElement>('button')?.focus();
   const keys=(e:KeyboardEvent)=>{
+   if(document.querySelector('[aria-label="恢复轻笺备份"]'))return;
    if(e.ctrlKey&&e.key.toLowerCase()==='s'){e.preventDefault();e.stopImmediatePropagation();return;}
    if(e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();closeRef.current();}
    if(e.key==='Tab'){const buttons=[...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),summary')??[])].filter(el=>el.getClientRects().length);const first=buttons[0],last=buttons.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}
@@ -31,9 +36,11 @@ export function DocumentImportDialog({defaultKind,preferences,onClose,onImported
  };
  const choose=async()=>{
   setError('');setPhase('choosing');
-  try{const paths=await invoke<string[]|null>('choose_document_files');if(!alive.current)return;if(!paths?.length){setPhase(preview?'preview':'pick');return;}
+  try{const paths=await invoke<string[]|null>('choose_document_files');if(!alive.current)return;if(!paths?.length){setPhase(preview?'preview':'pick');return;}if(paths.length>20)throw Error('最多选择 20 个文件，请分批导入');
    const old=request.current;if(old)await invoke('cancel_document_import',{requestId:old});const id=crypto.randomUUID();request.current=id;setPhase('parsing');setPreview(null);setResult(null);setChoices({});setMappings({});
-   const next=await invoke<Preview>('preview_documents',{requestId:id,paths});if(!alive.current||request.current!==id)return;accept(next);setPhase('preview');
+   const backupPaths=paths.filter(p=>/\.qjbackup$/i.test(p));const ordinary=paths.filter(p=>!/\.qjbackup$/i.test(p));setBackups(backupPaths);
+   if(!ordinary.length){setPhase('pick');return;}
+   const next=await invoke<Preview>('preview_documents',{requestId:id,paths:ordinary});if(!alive.current||request.current!==id)return;accept(next);setPhase('preview');
   }catch(e){if(alive.current){setError(String(e));setPhase(preview?'preview':'pick');}}
  };
  const remap=async(f:FilePreview)=>{
@@ -53,10 +60,11 @@ export function DocumentImportDialog({defaultKind,preferences,onClose,onImported
   catch(e){if(alive.current){setError(String(e));setPhase('preview');}}finally{onSaving(false);}
  };
  const chooseAll=(selected:boolean)=>setChoices(old=>{const next={...old};for(const e of valid)next[e.id]={...next[e.id],selected};return next;});
+ if(backups.length)return <BackupRestoreDialog path={backups[0]} preferences={preferences} onImported={()=>void onImported()} onClose={()=>{setBackups(old=>old.slice(1));if(backups.length===1&&!preview)close();}}/>;
  return <div className="dialog-backdrop document-import-backdrop"><section ref={dialog} className="document-import-dialog" role="dialog" aria-modal="true" aria-labelledby="document-import-title">
   <header className="document-import-heading"><h2 id="document-import-title">导入文档</h2><button aria-label="关闭导入" disabled={phase==='saving'} onClick={close}>×</button></header>
   <div className="document-import-content">
-   <p className="import-intro">TXT、Markdown、Word (.docx) 和 JSON · 本地处理</p>
+   <p className="import-intro">TXT、Markdown、JSON、Word (.docx)、轻笺备份 (.qjbackup) · 本地处理。备份单独预览恢复，随后预览普通文档。</p>
    <details className="import-limits"><summary>文件与格式限制</summary><p>最多 20 个文件；单文件 10 MiB，总计 30 MiB；最多 200 条，每条正文 500 KiB。富文本最多 20,000 个节点、2 MB；解析后正文总量 32 MiB。DOCX 解压最多 32 MiB、2,000 个包内文件，单 XML 16 MiB。结构深度最多 64；JSON 最多 100,000 个值，每个对象 100 个字段、字段名 128 字。TXT 仅支持 UTF-8 / UTF-8 BOM。不支持 .doc、加密文件或宏文件。图片及附件不自动下载。</p></details>
    {!result&&<div className="import-toolbar"><button disabled={busy} onClick={()=>void choose()}>{preview?'重新选择文件':'选择文件'}</button><label>默认目标<select aria-label="默认导入栏目" disabled={busy} value={target} onChange={e=>{const kind=e.target.value as ItemKind;setTarget(kind);setChoices(old=>Object.fromEntries(Object.entries(old).map(([id,c])=>[id,{...c,kind}])));}}><option value="sticky">便签</option><option value="note">笔记</option></select></label></div>}
    {busy&&<p className="import-processing" role="status">{phase==='choosing'?'请选择文件…':phase==='parsing'?'正在解析本地文件…':phase==='mapping'?'正在重新生成预览…':'正在备份并保存…'}</p>}

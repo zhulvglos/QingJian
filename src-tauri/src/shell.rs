@@ -2,7 +2,7 @@ use crate::{database::Database, quick_window::sync_quick};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::{collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::Mutex, time::{Duration, Instant}};
-use tauri::{Manager, PhysicalPosition, PhysicalSize};
+use tauri::{Emitter,Manager, PhysicalPosition, PhysicalSize};
 use crate::window_native::Bounds;
 use winreg::{enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE}, RegKey};
 
@@ -35,8 +35,8 @@ pub fn single_instance() -> Result<Option<Instance>,String> {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default,rename_all="camelCase")]
-pub struct Settings { always_on_top:bool, edge_hide:bool, auto_start:bool, x:Option<i32>, y:Option<i32>, height:f64, error:String }
-impl Default for Settings { fn default()->Self{Self{always_on_top:false,edge_hide:false,auto_start:std::env::var_os("QINGJIAN_TEST_MODE").is_none(),x:None,y:None,height:720.0,error:String::new()}} }
+pub struct Settings { transparency:u8,always_on_top:bool, edge_hide:bool, auto_start:bool, x:Option<i32>, y:Option<i32>, height:f64, error:String }
+impl Default for Settings { fn default()->Self{Self{transparency:0,always_on_top:false,edge_hide:false,auto_start:std::env::var_os("QINGJIAN_TEST_MODE").is_none(),x:None,y:None,height:720.0,error:String::new()}} }
 pub struct Runtime { settings:Settings, hidden:Option<(i32,i32)>, dock:Option<Dock>, sensor_armed:bool, busy:bool, drag_serial:u64, pending:Option<(Edge,Instant,u64,bool)>, last_save:Instant, repairs:u64 }
 #[derive(Clone,Copy)]struct Dock{edge:Edge,sensor:Bounds}
 #[derive(Clone,Copy,Debug,PartialEq,Serialize)]
@@ -97,7 +97,9 @@ pub fn reveal_shell(app:tauri::AppHandle){restore(&app);}
 pub fn toggle_shell_maximize(app:tauri::AppHandle)->Result<bool,String>{
     restore(&app);if let Some(s)=app.try_state::<Mutex<Runtime>>(){if let Ok(mut r)=s.lock(){r.pending=None;r.dock=None;}}
     let w=app.get_webview_window("main").ok_or("主窗口不可用")?;
-    let result=crate::window_native::toggle_maximize(&w);reassert(&app);result
+    let result=crate::window_native::toggle_maximize(&w)?;
+    // 原生大小切换结束即同步，不依赖延后的框架 Resize/最大化缓存事件。
+    sync_quick(&app).map_err(|e|e.to_string())?;reassert(&app);Ok(result)
 }
 #[tauri::command]
 pub fn get_shell_diagnostics(app:tauri::AppHandle)->Result<serde_json::Value,String>{
@@ -129,9 +131,10 @@ pub fn initialize(app:&tauri::AppHandle)->Result<(),String>{
     if let Some(q)=app.get_webview_window("quick"){q.set_always_on_top(settings.always_on_top).map_err(|e|e.to_string())?;}
     // WebView 创建会泵送 IPC：先注册运行状态，避免界面已加载但状态尚未注册的竞态。
     persist(app,&settings)?;
-    app.manage(Mutex::new(Runtime{settings,hidden:None,dock:None,sensor_armed:false,busy:false,drag_serial:0,pending:None,last_save:Instant::now(),repairs:0}));
+    app.manage(Mutex::new(Runtime{settings:settings.clone(),hidden:None,dock:None,sensor_armed:false,busy:false,drag_serial:0,pending:None,last_save:Instant::now(),repairs:0}));
     // 不再创建边缘把手 WebView；主窗口和快捷标签真正隐藏后，屏幕上不留任何标识。
     crate::window_native::attach(&main)?;
+    crate::window_native::transparency(app,settings.transparency)?;
 
     reassert(app);
     let handle=app.clone();
@@ -145,7 +148,8 @@ pub fn get_shell_settings(app:tauri::AppHandle)->Result<Settings,String>{let mut
 pub fn set_shell_setting(app:tauri::AppHandle,key:String,value:bool)->Result<Settings,String>{
     let mut s=app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化，请稍后重试")?.lock().map_err(|_|"窗口状态不可用")?.settings.clone();
     match key.as_str(){
-        "alwaysOnTop"=>{for label in ["main","quick","edge"]{if let Some(w)=app.get_webview_window(label){w.set_always_on_top(value).map_err(|e|e.to_string())?;}}s.always_on_top=value;},
+        // Tauri 层级切换会隐藏 owned 快捷窗口；统一使用不激活、不改变可见性的原生接口。
+        "alwaysOnTop"=>{s.always_on_top=value;},
         "edgeHide"=>{restore(&app);if let Some(state)=app.try_state::<Mutex<Runtime>>(){if let Ok(mut r)=state.lock(){r.pending=None;r.dock=None;}}s.edge_hide=value;},
         "autoStart"=>{set_autostart(value)?;s.auto_start=value;},
         _=>return Err("未知窗口设置".into())
@@ -161,6 +165,7 @@ pub fn set_shell_busy(app:tauri::AppHandle,busy:bool){if let Some(s)=app.try_sta
 pub fn apply_backup_window(app:tauri::AppHandle,settings:serde_json::Value)->Result<(),String>{
     // 只有用户勾选“应用备份设置”后调用；不从备份执行任意注册表或路径操作。
     for key in ["alwaysOnTop","edgeHide","autoStart"]{if let Some(value)=settings[key].as_bool(){set_shell_setting(app.clone(),key.into(),value)?;}}
+    if let Some(value)=settings["transparency"].as_u64(){set_background_transparency(app.clone(),u8::try_from(value).map_err(|_|"透明度无效")?)?;}
     let main=app.get_webview_window("main").ok_or("窗口不可用")?;
     restore(&app);
     if let Some(m)=main.current_monitor().map_err(|e|e.to_string())?{
@@ -254,4 +259,16 @@ fn tick(app:&tauri::AppHandle){
   assert!(z.contains(-1920,200));assert!(!z.contains(-1920,0));assert!(!z.contains(-1917,200));
   assert_eq!(contact(b(1922,100,2500,1000),b(1920,0,5760,2160),-400,0),None);
  }
+}
+
+#[tauri::command]
+pub fn set_background_transparency(app:tauri::AppHandle,value:u8)->Result<Settings,String>{
+ if value>70||value%5!=0{return Err("透明度须为 0%～70%，步进 5%".into());}
+ let state=app.try_state::<Mutex<Runtime>>().ok_or("窗口正在初始化")?;
+ let mut runtime=state.lock().map_err(|_|"窗口状态不可用")?;
+ let mut settings=runtime.settings.clone();settings.transparency=value;
+ persist(&app,&settings)?;runtime.settings=settings;drop(runtime);
+ crate::window_native::transparency(&app,value)?;
+ app.emit("background-transparency",value).map_err(|e|e.to_string())?;
+ get_shell_settings(app)
 }

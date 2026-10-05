@@ -65,7 +65,7 @@ fn copy_pair(v:&Value,base:&Path)->Result<PathBuf,String>{
 #[tauri::command]
 pub async fn save_recording_audio(id:String,app:tauri::AppHandle)->Result<Value,String>{tauri::async_runtime::spawn_blocking(move||{
     let _guard=ProcessingGuard::acquire()?;if audio::active(){return Err("请先停止录音".into());}let mut v=audio::session(&app,&id)?;
-    let Some(base)=rfd::FileDialog::new().set_title("选择保存双路录音的目录").pick_folder()else{return Ok(v)};
+    let Some(base)=crate::native_dialog::run(||rfd::FileDialog::new().set_title("选择保存双路录音的目录").pick_folder())?else{return Ok(v)};
     let dest=copy_pair(&v,&base)?;let old=v.clone();v["mic"]=json!(dest.join("mic.wav"));v["system"]=json!(dest.join("system.wav"));v["savedDir"]=json!(dest);v["storage"]=json!("saved");v["savedAt"]=json!(chrono::Utc::now().to_rfc3339());audio::put_session(&app,&v)?;
     // 数据库已指向经验证的双轨副本之后，只清理本次托管临时文件。
     if old["storage"]=="temporary" {if let Some(dir)=old["temporaryDir"].as_str().and_then(|p|Path::new(p).canonicalize().ok()) {

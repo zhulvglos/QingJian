@@ -1,6 +1,6 @@
 [package]
 name = "qingjian_shell"
-version = "0.10.12"
+version = "0.10.17"
 description = "轻笺 V1 本地内容"
 authors = ["SHUSHIN"]
 edition = "2021"

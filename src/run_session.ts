@@ -2,10 +2,12 @@ import {useLayoutEffect,useState,type Dispatch,type SetStateAction,type RefObjec
 
 // 只在当前 WebView 内存中保留，不使用 localStorage/sessionStorage；完整退出后自然清空。
 const values=new Map<string,unknown>();
+export function setRunValue(key:string,value:unknown){values.set(key,value);window.dispatchEvent(new CustomEvent('qingjian-run-state',{detail:key}));}
 export function useRunState<T>(key:string,initial:T|(()=>T)):[T,Dispatch<SetStateAction<T>>]{
  const read=()=>{if(!values.has(key))values.set(key,typeof initial==='function'?(initial as ()=>T)():initial);return values.get(key) as T;};
  const [slot,setSlot]=useState(()=>({key,value:read()}));
  if(slot.key!==key)setSlot({key,value:read()});
+ useLayoutEffect(()=>{const update=(event:Event)=>{if((event as CustomEvent).detail===key)setSlot({key,value:read()});};window.addEventListener('qingjian-run-state',update);return()=>window.removeEventListener('qingjian-run-state',update);},[key]);
  const set:Dispatch<SetStateAction<T>>=next=>{const previous=read();const value=typeof next==='function'?(next as (p:T)=>T)(previous):next;values.set(key,value);setSlot({key,value});};
  return [slot.key===key?slot.value:read(),set];
 }

@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex, time::Duration};
-use tauri::State;
+use tauri::{State,Manager};
 use uuid::Uuid;
 
 pub struct Database(pub Mutex<Connection>);
@@ -170,6 +170,9 @@ pub fn open(directory: &std::path::Path) -> Result<(Database, PathBuf), String> 
     let mut conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(|e| e.to_string())?;
+    let version:i64=conn.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(save_error)?;
+    // 真正执行启动迁移前，SQLite 自身生成一致性快照，包含 WAL 已提交数据。
+    if (1..5).contains(&version){let dir=directory.join("backups");std::fs::create_dir_all(&dir).map_err(|e|e.to_string())?;let before=dir.join(format!("数据库升级前-{}.sqlite3",Uuid::new_v4()));conn.execute("VACUUM INTO ?1",[before.to_string_lossy().as_ref()]).map_err(save_error)?;let check=Connection::open(&before).map_err(save_error)?;let result:String=check.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(save_error)?;if result!="ok"{return Err("升级前数据库备份校验失败，已停止迁移".into());}}
     migrate(&mut conn)?;
     Ok((Database(Mutex::new(conn)), path))
 }
@@ -210,8 +213,9 @@ pub fn restore_item(id: String, database: State<'_, Database>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn delete_item_forever(id: String, database: State<'_, Database>) -> Result<(), String> {
+pub fn delete_item_forever(id: String, database: State<'_, Database>,app:tauri::AppHandle) -> Result<(), String> {
     let conn = database.0.lock().map_err(|_| "数据库暂时不可用")?;
+    crate::backup::before_document_import(&conn,serde_json::json!({"theme":"warm_apricot","fontSize":"standard"}),&app.state::<crate::data_root::DataRoot>().0)?;
     // 外键级联移除快捷固定；仅允许删除已在回收站的条目。
     let changed = conn.execute("DELETE FROM items WHERE id=?1 AND deleted_at IS NOT NULL", [&id]).map_err(save_error)?;
     if changed != 1 { return Err("永久删除失败：请先将条目移入回收站".into()); }

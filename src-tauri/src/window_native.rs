@@ -17,6 +17,8 @@ impl From<Rect> for Bounds{fn from(r:Rect)->Self{Self{left:r.left,top:r.top,righ
 extern "system" {
  fn SetWindowPos(h:isize,after:isize,x:i32,y:i32,w:i32,hgt:i32,flags:u32)->i32;
  fn GetWindowLongPtrW(h:isize,index:i32)->isize;
+ fn SetWindowLongPtrW(h:isize,index:i32,value:isize)->isize;
+ fn SetLayeredWindowAttributes(h:isize,color:u32,alpha:u8,flags:u32)->i32;
  fn GetForegroundWindow()->isize;fn GetWindow(h:isize,cmd:u32)->isize;
  fn GetWindowThreadProcessId(h:isize,pid:*mut u32)->u32;
  fn IsWindowVisible(h:isize)->i32;
@@ -103,6 +105,10 @@ pub fn topmost(w:&tauri::WebviewWindow,value:bool)->Result<(),String>{
  let h=w.hwnd().map_err(|e|e.to_string())?.0 as isize;
  // NOACTIVATE 防止切换应用、恢复窗口层级时抢走其他软件的输入焦点。
  if unsafe{SetWindowPos(h,if value{-1}else{-2},0,0,0,0,0x213)}==0{return Err("Windows 窗口层级更新失败".into());}Ok(())
+}
+// Windows 对最终合成的顶层窗口统一施加 alpha，不改变子控件或开启鼠标穿透。
+pub fn transparency(app:&tauri::AppHandle,value:u8)->Result<(),String>{
+ for label in ["main","quick"]{if let Some(w)=app.get_webview_window(label){let h=w.hwnd().map_err(|e|e.to_string())?.0 as isize;unsafe{let style=GetWindowLongPtrW(h,-20);SetWindowLongPtrW(h,-20,style|0x80000);if SetLayeredWindowAttributes(h,0,((100-value as u32)*255/100) as u8,2)==0{return Err("Windows 整窗透明度设置失败".into());}}}}Ok(())
 }
 fn rank(mut h:isize)->u32{let mut n=0;unsafe{while h!=0&&n<4096{h=GetWindow(h,3);n+=1;}}n}
 pub fn snapshot(app:&tauri::AppHandle)->serde_json::Value{

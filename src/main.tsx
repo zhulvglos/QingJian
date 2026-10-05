@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import {firstReminderDraft,discardReminderDrafts} from './reminder_drafts';
 import { ItemWorkspace } from './item_workspace';
 import { NewsPanel } from './news_panel';
 import { WindowSettings } from './window_settings';
@@ -13,15 +14,17 @@ import {AudioPanel,type AudioGuard} from './audio_panel';
 import {QuickSearch} from './quick_search';
 import {VoiceSettings,OnlineSettings} from './model_settings';
 import {readDocument,documentText} from './rich_document';
-import {useRunScroll} from './run_session';
+import {useRunScroll,setRunValue} from './run_session';
 import type { Draft, Item, ItemKind, ItemView, Reminder } from './item_workspace';
 import './style.css';
+import {NavIcon} from './ui_icons';
+import {applyBackgroundTransparency} from './background';
 const brandIcon = new URL('./assets/qingjian-brand.svg', import.meta.url).href;
 
 type Section = 'news' | 'stickies' | 'notes' | 'settings';
 type ThemeId = 'mint_morning' | 'new_leaf' | 'warm_apricot' | 'coral' | 'lilac_mist';
 type FontSize = 'small' | 'standard' | 'large';
-type LeaveAction = {type:'configure';tab:'语音'|'模型'|'录音'} | { type: 'transcript'; text:string; item?:Item } | { type: 'section'; section: Section } | { type: 'tab'; tab: string } | { type: 'item' | 'pin' | 'trash'; item: Item } | { type: 'new'; kind: ItemKind } | { type: 'hide' | 'quit' };
+type LeaveAction = {type:'configure';tab:'语音'|'模型'} | { type: 'transcript'; text:string; item?:Item } | { type: 'section'; section: Section } | { type: 'tab'; tab: string } | { type: 'item' | 'pin' | 'trash'; item: Item } | { type: 'new'; kind: ItemKind } | { type: 'hide' | 'quit' };
 type DeleteConfirm = { type: 'trash' | 'forever'; item: Item };
 type TaskInfo={kind:string;label:string;status:string;startedAt?:string;endedAt?:string;progress?:string;canCancel?:boolean};
 type TaskSnapshot={modelNews:TaskInfo;textTest:TaskInfo;formalOnline:TaskInfo;audio:TaskInfo;recording:boolean};
@@ -49,7 +52,7 @@ const subnav: Record<Section, string[]> = {
   news: ['AI 新闻', '模型资讯'],
   stickies: ['+ 新建', '待办', '已完成', '回收站'],
   notes: ['+ 新建', '待办', '已完成', '回收站'],
-  settings: ['通用', '文件', '模型', '语音', '录音'],
+  settings: ['通用', '文件', '模型', '语音'],
 };
 const defaultSubnav: Record<Section, string> = {
   news: 'AI 新闻', stickies: '+ 新建', notes: '+ 新建', settings: '通用',
@@ -101,12 +104,19 @@ function App() {
   const tab=tabs[section];
   const setTab=(value:string)=>setTabs(previous=>({...previous,[section]:value}));
   const navigate=(next:Section,value?:string)=>{setSection(next);if(value)setTabs(previous=>({...previous,[next]:value}));};
+  const [transparency,setTransparency]=useState(0);
+  const [topmost,setTopmost]=useState(false);
+  useEffect(()=>{let live=true;const read=()=>void invoke<{alwaysOnTop:boolean}>('get_shell_settings').then(s=>{if(live)setTopmost(s.alwaysOnTop);}).catch(()=>{});read();const timer=setInterval(read,500);return()=>{live=false;clearInterval(timer);};},[]);
+  useEffect(()=>{let live=true;let timer:number;let attempts=0;const read=()=>void invoke<{transparency:number}>('get_shell_settings').then(s=>{if(live)setTransparency(s.transparency||0);}).catch(()=>{if(live&&attempts++<20)timer=window.setTimeout(read,100);});read();const listener=listen<number>('background-transparency',e=>setTransparency(e.payload));return()=>{live=false;clearTimeout(timer);void listener.then(f=>f());};},[]);
   const [theme, setTheme] = useState<ThemeId>(initialTheme);
   const [fontSize, setFontSize] = useState<FontSize>(initialFontSize);
+  useEffect(()=>{let live=true,attempts=0;const save=()=>void invoke('backup_preferences',{preferences:{theme,fontSize}}).catch(()=>{if(live&&attempts++<20)setTimeout(save,150);});save();return()=>{live=false;};},[theme,fontSize]);
+  useEffect(()=>applyBackgroundTransparency(transparency),[theme,transparency]);
   const [items, setItems] = useState<Record<ItemKind, Item[]>>({ sticky: [], note: [] });
   const [trashed, setTrashed] = useState<Record<ItemKind, Item[]>>({ sticky: [], note: [] });
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [bellOpen, setBellOpen] = useState(false);
+  const [audioOpen,setAudioOpen]=useState(false);
   const [recording,setRecording]=useState(false),[recordLeave,setRecordLeave]=useState<LeaveAction|null>(null);
   const [loading, setLoading] = useState(true);
   const [dataError, setDataError] = useState('');
@@ -116,6 +126,7 @@ function App() {
   const [status, setStatus] = useState('');
   const [saving, setSaving] = useState(false);
   const [importKind,setImportKind]=useState<ItemKind|null>(null),[importSaving,setImportSaving]=useState(false);
+  useEffect(()=>{const busy=(e:Event)=>setImportSaving((e as CustomEvent<boolean>).detail);const appearance=(e:Event)=>{const p=(e as CustomEvent).detail;setTheme(p.theme);setFontSize(p.fontSize);};window.addEventListener('backup-saving',busy);window.addEventListener('backup-appearance',appearance);return()=>{window.removeEventListener('backup-saving',busy);window.removeEventListener('backup-appearance',appearance);};},[]);
   const [drafts,setDrafts]=useState<Record<ItemKind,Draft|null>>({sticky:null,note:null});
   const kind=section==='stickies'?'sticky':section==='notes'?'note':null;
   const draft=kind?drafts[kind]:null;
@@ -164,7 +175,7 @@ function App() {
     } catch (error) { setDataError(String(error)); }
     finally { setLoading(false); }
   };
-  useEffect(() => { void reload(); }, []);
+  useEffect(() => { void reload(); const p=listen('content-collected',()=>void reload()); return ()=>{void p.then(f=>f());}; }, []);
   useEffect(()=>{
     if(loading)return;
     // 删除或导入后安全回退；检查只随实际列表更新，不因编辑草稿自动提交或保存。
@@ -176,7 +187,9 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [status]);
 
+  const [reminderLeave,setReminderLeave]=useState(false);
   const doAction = async (action: LeaveAction) => {
+    if(action.type==='quit'&&firstReminderDraft()){setReminderLeave(true);return;}
     setSaveError(''); setStatus(''); setActionError('');
     setBellOpen(false);
     if(action.type==='transcript'){
@@ -213,7 +226,7 @@ function App() {
   const anyDirty=Object.values(drafts).some(dirtyDraft);
   useEffect(() => {
     // 编辑焦点、草稿与对话框保护贴边隐藏；鼠标拖动由 Windows 按键状态另行保护。
-    const update = () => { const focus=document.activeElement; const editing=focus instanceof HTMLElement&&(focus.isContentEditable||focus.matches('textarea,input:not([type="checkbox"]):not([type="radio"]),select')); const modal=!!document.querySelector('[role="dialog"],[data-native-dialog-busy="true"]'); void invoke('set_shell_busy',{busy:anyDirty||!!pending||!!deleteConfirm||bellOpen||saving||editing||modal}).catch(()=>{}); };
+    const update = () => { const focus=document.activeElement; const editing=focus instanceof HTMLElement&&(focus.isContentEditable||focus.matches('textarea,input:not([type="checkbox"]):not([type="radio"]),select')); const modal=!!document.querySelector('[role="dialog"],[data-native-dialog-busy="true"]'); void invoke('set_shell_busy',{busy:anyDirty||!!firstReminderDraft()||!!pending||!!deleteConfirm||bellOpen||saving||editing||modal}).catch(()=>{}); };
     update();const timer=window.setInterval(update,250);return()=>window.clearInterval(timer);
   },[anyDirty,pending,deleteConfirm,bellOpen,saving]);
   const requestAction = (action: LeaveAction) => {
@@ -268,14 +281,14 @@ function App() {
   saveRef.current = save;
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (draft && event.ctrlKey && !event.altKey && event.key.toLowerCase() === 's') {
+      if (!audioOpen && !event.defaultPrevented && draft && event.ctrlKey && !event.altKey && event.key.toLowerCase() === 's') {
         event.preventDefault();
         void saveRef.current(pending ?? undefined);
       }
     };
     document.addEventListener('keydown', keydown);
     return () => document.removeEventListener('keydown', keydown);
-  }, [pending, !!draft]);
+  }, [pending, !!draft,audioOpen]);
   const resolveDiscard = () => {
     const next = pending; setPending(null);
     // 放弃草稿时还原已保存快照；托盘恢复不能重新出现被放弃的文字。
@@ -353,9 +366,10 @@ function App() {
         <img className="brand-icon" src={brandIcon} alt="" draggable={false} /><span className="brand-name">轻笺</span>
       </div>
       <div className="title-actions">
-        {section==='notes'&&<button className="icon-button" title="录音与转写" aria-label="录音与转写" onClick={()=>requestAction({type:'configure',tab:'录音'})}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>}
+        {<button className={'icon-button quick-record-button '+(recording?'recording-active':'')} title={recording?'查看当前录音':'录音与转写'} aria-label="录音与转写" aria-pressed={recording} onClick={()=>{setAudioOpen(true);}}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>}
         <QuickSearch items={[...items.sticky,...items.note]} onOpen={item=>requestAction({type:'pin',item})}/>
-        <button className="icon-button" title="提醒中心" aria-label="提醒中心" aria-expanded={bellOpen} onClick={() => setBellOpen((value) => !value)}><BellIcon /></button>
+        <button className={'icon-button window-pin '+(topmost?'active':'')} title={topmost?'取消置顶':'置顶'} aria-label={topmost?'取消置顶':'置顶'} aria-pressed={topmost} onClick={()=>void invoke<{alwaysOnTop:boolean}>('set_shell_setting',{key:'alwaysOnTop',value:!topmost}).then(s=>setTopmost(s.alwaysOnTop)).catch(e=>setActionError(String(e)))}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l-1 7 4 4H5l4-4-1-7ZM12 14v7"/></svg></button>
+        {reminders.some(entry=>entry.status==='pending'&&entry.isCurrent)&&<button className="icon-button" title="提醒中心" aria-label="提醒中心" aria-expanded={bellOpen} onClick={() => setBellOpen((value) => !value)}><BellIcon /></button>}
         <span className="title-separator" />
         <button className="icon-button system-button" title="最小化" aria-label="最小化" onClick={() => void appWindow.minimize()}>−</button>
         <button className="icon-button system-button" title={maximized?'还原':'最大化'} aria-label={maximized?'还原':'最大化'} disabled={sizeChanging} onClick={()=>{setSizeChanging(true);void invoke<boolean>('toggle_shell_maximize').then(setMaximized).catch(e=>setActionError(String(e))).finally(()=>setSizeChanging(false));}}>{maximized?<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8V4h12v12h-4"/><rect x="4" y="8" width="12" height="12"/></svg>:<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16"/></svg>}</button>
@@ -375,30 +389,30 @@ function App() {
     </div>}
 
     <nav className="primary-nav" aria-label="主导航">
-      {sections.map((item) => <button key={item.id} className={section === item.id ? 'active' : ''} onClick={() => requestAction({ type: 'section', section: item.id })}>{item.label}</button>)}
+      {sections.map((item) => <button key={item.id} title={item.label} aria-label={item.label} className={section === item.id ? 'active' : ''} onClick={() => requestAction({ type: 'section', section: item.id })}>{item.label}</button>)}
     </nav>
     <nav className={'secondary-nav ' + (section === 'settings' ? 'settings-tabs' : section === 'news' ? 'news-tabs' : '')} aria-label={sectionLabel + '子导航'}>
       {subnav[section].map((item) => {
         const isItem = section === 'stickies' || section === 'notes';
         const disabled = false;
-        return <button key={item} className={tab === item ? 'active' : ''} disabled={disabled} title={disabled ? item + '尚未接入' : undefined} onClick={() => item === '+ 新建' && isItem ? requestAction({ type: 'new', kind: section === 'stickies' ? 'sticky' : 'note' }) : requestAction({ type: 'tab', tab: item })}>{item}</button>;
+        return <button key={item} className={tab === item ? 'active' : ''} disabled={disabled} title={item==='+ 新建'?'新建':item==='已完成'?'已办':item} aria-label={item==='+ 新建'?'新建':item==='已完成'?'已办':item} onClick={() => item === '+ 新建' && isItem ? requestAction({ type: 'new', kind: section === 'stickies' ? 'sticky' : 'note' }) : requestAction({ type: 'tab', tab: item })}>{item==='+ 新建'?<NavIcon name="new"/>:item==='回收站'?<NavIcon name="trash"/>:item==='已完成'?'已办':item}</button>;
       })}
     </nav>
-    <div ref={contentRef} className={'content-stage '+(section==='news'?'news-content-stage':section==='settings'&&tab==='录音'?'recording-content-stage':'')}>
+    <div ref={contentRef} className={'content-stage '+(section==='news'?'news-content-stage':audioOpen?'recording-content-stage':'')}>
       {section === 'news' && <section className="news-stage">
-        {tab==='AI 新闻'?<NewsPanel/>:<FreeApiPanel/>}
+        {tab==='AI 新闻'?<NewsPanel onView={id=>void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'item',item}))}/>:<FreeApiPanel onView={id=>void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'item',item}))}/>}
       </section>}
       {showItemWorkspace && <div className="items-stage">
-        <div className="items-import-toolbar"><button disabled={saving||importSaving||!!pending||!!audioPending} onClick={()=>{capturePosition();setImportKind(section==='stickies'?'sticky':'note');}}>导入</button></div>
+
         {actionError && <div className="operation-error" role="alert">{actionError}</div>}
         <ItemWorkspace key={section} kind={section === 'stickies' ? 'sticky' : 'note'} view={tab as ItemView} items={items[section === 'stickies' ? 'sticky' : 'note']} trashed={trashed[section === 'stickies' ? 'sticky' : 'note']} reminders={reminders} draft={draft?.kind === (section === 'stickies' ? 'sticky' : 'note') ? draft : null} editorSession={editorSession} loading={loading} error={dataError} saveError={saveError} status={status} onSelect={(item) => requestAction({ type: 'item', item })}
           onTitleChange={(title) => { setDraft((current) => current ? { ...current, title } : null); setSaveError(''); setStatus(''); }}
           onBodyChange={(body, bodyJson) => { setDraft((current) => current ? { ...current, body, bodyJson } : null); setSaveError(''); setStatus(''); }}
           onDelete={(item) => requestAction({ type: 'trash', item })} onRestore={(item) => void restore(item)} onPermanent={(item) => { setActionError(''); setDeleteConfirm({ type: 'forever', item }); }} onReload={() => void reload()}
-          onTogglePinned={(item) => void togglePinned(item)} onMove={(item, target) => void moveItem(item, target)} onSaveReminder={saveReminder} onCancelReminder={cancelReminder} onCompleteReminder={completeReminder} />
+          onImport={()=>{capturePosition();setImportKind(section==='stickies'?'sticky':'note');}} onExport={async (ids,format,includeSettings)=>{setActionError('');try{const directory=await invoke<string|null>('choose_export_folder');if(!directory)return false;await invoke('export_documents',{directory,format,preferences:{theme,fontSize},selectedIds:ids,includeSettings});setStatus(`已导出 ${ids.length} 条${section==='stickies'?'便签':'笔记'}`);return true;}catch(e){setActionError('导出失败：'+String(e));return false;}}} onTogglePinned={(item) => void togglePinned(item)} onMove={(item, target) => void moveItem(item, target)} onSaveReminder={saveReminder} onCancelReminder={cancelReminder} onCompleteReminder={completeReminder} />
       </div>}
-      <AudioPanel guardRef={audioGuard} open={section==='settings'&&tab==='录音'} onActive={setRecording} notes={items.note} onConfigure={next=>requestAction({type:'configure',tab:next})} onDraft={(text,item)=>requestAction({type:'transcript',text,item})}/>
-      {section === 'settings' && tab!=='录音' && <section className="settings-stage">
+      <div className="recording-overlay" hidden={!audioOpen} role={audioOpen?'dialog':undefined} aria-label="录音工作区"><div className="recording-overlay-heading"><span>录音与转写</span><button onClick={()=>setAudioOpen(false)}>收起</button></div><AudioPanel guardRef={audioGuard} open={audioOpen} onActive={setRecording} notes={items.note} onConfigure={next=>{setAudioOpen(false);requestAction({type:'configure',tab:next});}} onDraft={(text,item)=>{setAudioOpen(false);requestAction({type:'transcript',text,item});}}/></div>
+      {section === 'settings' && <section className="settings-stage">
         {tab === '通用' ? <>
           <div className="settings-heading"><span className="settings-kicker">外观</span><h1>选择轻笺的色彩</h1><p>五套皮肤来自 PRD 指定色卡，首次启动使用暖杏。</p></div>
           <div className="theme-list" aria-label="皮肤选择">
@@ -422,6 +436,7 @@ function App() {
     {/* 高窗口从底部握柄上拖，中心也能进入顶部区域；不改变中心判定规则。 */}
     <button className="window-drag-grip" title="拖动窗口；贴边松手 0.5 秒后隐藏" aria-label="拖动窗口" disabled={maximized} onMouseDown={event=>{if(event.button===0&&!maximized){event.preventDefault();void invoke("begin_grip_drag");}}}><span /></button>
 
+    {reminderLeave&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-modal="true" aria-label="未保存的提醒修改"><h2>有未保存的提醒修改</h2><p>提醒草稿在本次运行中保留，完全退出后将丢失。</p><div className="dialog-actions"><button onClick={()=>{setReminderLeave(false);const owner=firstReminderDraft();if(owner){setRunValue(owner.kind+'.+ 新建.mode.'+(owner.id??'new'),'reminder');navigate(owner.kind==='sticky'?'stickies':'notes','+ 新建');if(owner.id){const item=items[owner.kind].find(i=>i.id===owner.id);if(item)void doAction({type:'item',item});}}}}>继续编辑</button><button onClick={()=>{discardReminderDrafts();setReminderLeave(false);void doAction({type:'quit'});}}>放弃提醒修改并退出</button><button onClick={()=>setReminderLeave(false)}>取消</button></div></section></div>}
     {recordLeave&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-label="正在录音"><h2>录音仍在进行</h2><p>停止后音频会临时保留，可稍后转写；也可继续录音。</p>{saveError&&<p role="alert">{saveError}</p>}<div className="dialog-actions"><button onClick={()=>void(async()=>{try{await invoke('stop_recording');setRecording(false);const a=recordLeave;setRecordLeave(null);if(anyDirty){const d=Object.values(drafts).find(dirtyDraft);if(d)navigate(d.kind==='sticky'?'stickies':'notes','+ 新建');setPending(a);}else void doAction(a);}catch(e){setSaveError(String(e));}})()}>停止并暂存音频后继续</button>{recordLeave.type==='hide'&&<button onClick={()=>{const a=recordLeave;setRecordLeave(null);if(anyDirty){const d=Object.values(drafts).find(dirtyDraft);if(d)navigate(d.kind==='sticky'?'stickies':'notes','+ 新建');setPending(a);}else void doAction(a);}}>继续录音并进入托盘</button>}<button onClick={()=>setRecordLeave(null)}>取消</button></div></section></div>}
     {audioPending&&<div className="dialog-backdrop"><section className="leave-dialog" role="dialog" aria-modal="true" aria-label="未保存的转写校对"><h2>有未保存的校对</h2><p>保存当前转写或纪要的修改？</p><div className="dialog-actions"><button disabled={audioSaving} onClick={()=>void(async()=>{setAudioSaving(true);try{if(await audioGuard.current?.save()){const next=audioPending;setAudioPending(null);await doAction(next);}}finally{setAudioSaving(false);}})()}>{audioSaving?'保存中…':'保存'}</button><button disabled={audioSaving} onClick={()=>{audioGuard.current?.discard();const next=audioPending;setAudioPending(null);void doAction(next);}}>放弃</button><button disabled={audioSaving} onClick={()=>setAudioPending(null)}>继续编辑</button></div></section></div>}
     {pending && <div className="dialog-backdrop"><div className="leave-dialog" role="dialog" aria-modal="true" aria-labelledby="leave-title">

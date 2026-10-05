@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod window_native;
+mod native_dialog;
 
 mod sensevoice;
 mod sensevoice_env;
@@ -14,9 +15,12 @@ mod data_root;
 mod shell;
 mod news;
 mod backup;
+mod auto_backup;
+mod document_export;
 mod document_formats;
 mod document_docx;
 mod document_import;
+mod news_collect;
 mod calendar;
 mod free_api;
 mod juya;
@@ -84,7 +88,7 @@ fn finish_leave(action: &str, app: tauri::AppHandle) -> Result<(), String> {
     match action {
         "hide" => {
             shell::restore(&app);
-            if let Some(quick) = app.get_webview_window("quick") { quick.hide().map_err(|e| e.to_string())?; }
+            if let Some(quick) = app.get_webview_window("quick") { window_native::hide(&quick).map_err(|e| e.to_string())?; }
             if let Some(main) = app.get_webview_window("main") { main.hide().map_err(|e| e.to_string())?; }
             Ok(())
         }
@@ -124,11 +128,11 @@ fn main() {
     tauri::Builder::default()
         .manage(instance)
         .manage(Mutex::new(QuickState::default()))
-        .invoke_handler(tauri::generate_handler![document_import::choose_document_files,document_import::preview_documents,document_import::remap_document_json,document_import::cancel_document_import,document_import::commit_documents,window_native::begin_grip_drag,shell::toggle_shell_maximize,delete_recording,list_recording_headers,get_recording,retry_audio_segment,reset_transcription_job,save_recording_text,play_recording_at,pause_recording,get_model_news,refresh_model_news,model_news_task_status,cancel_model_news,task_status,preview_audio_inputs,audio_devices,transcribe_recording,set_recording_route,save_recording_audio,open_recording_folder,discard_recording_audio,install_sensevoice,online_config,save_online_config,test_online_model,online_test_status,cancel_online_test,process_online,audio_config,save_audio_config,choose_audio_path,start_recording,stop_recording,recording_status,list_recordings,play_recording,stop_playback,transcribe_local,check_local_model,get_shell_settings,set_shell_setting,set_shell_busy,get_shell_diagnostics,reveal_shell,get_news_cache,get_news_update_status,refresh_news,open_news_link,get_quick_side, set_quick_expanded, set_quick_content_count, set_quick_content_height, set_quick_drag_active, list_items, list_trashed, save_item, get_item, list_pins, pin_item, unpin_item, trash_item, restore_item, delete_item_forever, set_item_pinned, move_item, list_reminders, save_reminder, cancel_reminder, complete_reminder, completed_reminder_count, complete_quick_drag, finish_leave,apply_backup_media,backup_entries,choose_backup_path,export_backup,preview_backup,import_backup,get_holidays,refresh_holidays,get_free_api_cache,refresh_free_api,apply_backup_window])
+        .invoke_handler(tauri::generate_handler![auto_backup::test_auto_backup_tick,auto_backup::backup_preferences,auto_backup::auto_backup_status,auto_backup::configure_auto_backup,auto_backup::backup_now,auto_backup::open_backup_folder,document_export::choose_export_folder,document_export::export_documents,document_import::choose_document_files,document_import::preview_documents,document_import::remap_document_json,document_import::cancel_document_import,document_import::commit_documents,news_collect::collect_news,window_native::begin_grip_drag,shell::toggle_shell_maximize,shell::set_background_transparency,delete_recording,list_recording_headers,get_recording,retry_audio_segment,reset_transcription_job,save_recording_text,play_recording_at,pause_recording,get_model_news,refresh_model_news,model_news_task_status,cancel_model_news,task_status,preview_audio_inputs,audio_devices,get_recording_inputs,save_recording_inputs,transcribe_recording,set_recording_route,save_recording_audio,open_recording_folder,discard_recording_audio,install_sensevoice,online_config,save_online_config,test_online_model,online_test_status,cancel_online_test,process_online,audio_config,save_audio_config,choose_audio_path,start_recording,stop_recording,recording_status,list_recordings,play_recording,stop_playback,transcribe_local,check_local_model,get_shell_settings,set_shell_setting,set_shell_busy,get_shell_diagnostics,reveal_shell,get_news_cache,get_news_update_status,refresh_news,open_news_link,quick_window::set_quick_menu_size,quick_window::set_quick_compact_width,quick_window::set_quick_hover_width,get_quick_side, set_quick_expanded, set_quick_content_count, set_quick_content_height, set_quick_drag_active, list_items, list_trashed, save_item, get_item, list_pins, pin_item, unpin_item, trash_item, restore_item, delete_item_forever, set_item_pinned, move_item, list_reminders, save_reminder, cancel_reminder, complete_reminder, completed_reminder_count, complete_quick_drag, finish_leave,apply_backup_media,backup_entries,choose_backup_path,export_backup,preview_backup,import_backup,get_holidays,refresh_holidays,get_free_api_cache,refresh_free_api,apply_backup_window])
         .setup(move |app| {
             let main=tauri::WebviewWindowBuilder::new(app,"main",tauri::WebviewUrl::App("index.html".into()))
                 .title("轻笺 V1").inner_size(327.0,720.0).min_inner_size(326.0,480.0)
-                .decorations(false).resizable(true).visible(false)
+                .decorations(false).transparent(true).background_color(tauri::utils::config::Color(0,0,0,0)).resizable(true).visible(false)
                 .data_directory(data_root.join("webview")).build()?;
             let _=main;
             app.manage(data_root::DataRoot(data_root.clone()));
@@ -139,6 +143,7 @@ fn main() {
             eprintln!("轻笺数据文件：{}", path.display());
             create_quick(app)?;
             shell::initialize(app.handle()).map_err(std::io::Error::other)?;
+            auto_backup::start(app.handle().clone());
             news::start_background(app.handle().clone());
             show_main(app.handle());
             model_news::start_background(app.handle().clone());

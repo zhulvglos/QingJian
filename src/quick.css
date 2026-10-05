@@ -20,9 +20,6 @@ button { font:inherit; cursor:pointer; }
 .pin-card { display:block; width:100%; min-height:48px; padding:9px 10px 9px 11px; border:1px solid var(--border); border-left:0; border-radius:0 18px 18px 0; background:var(--tint); color:var(--text); font-size:var(--quick-font); font-weight:600; line-height:1.35; text-align:left; overflow-wrap:anywhere; white-space:normal; box-shadow:1px 2px 5px #2d1f1018; }
 :root[data-side="left"] .pin-card { border-left:1px solid var(--border); border-right:0; border-radius:19px 0 0 19px; }
 .pin-card:hover,.pin-card:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); outline-offset:-2px; }
-#quick-close { position:absolute; z-index:2; top:3px; right:10px; width:20px; height:20px; padding:0; border:0; border-radius:50%; background:var(--surface); color:var(--accent); font-size:18px; line-height:1; opacity:0; }
-#quick-panel:hover #quick-close,#quick-close:focus-visible { opacity:.9; }
-:root[data-side="left"] #quick-close { right:auto; left:10px; transform:rotate(180deg); }
 #quick-empty { margin:12px; padding:12px; border-radius:0 15px 15px 0; background:var(--tint); color:var(--muted); font-size:var(--quick-font); line-height:1.5; }
 #quick-error { position:absolute; bottom:2px; left:2px; right:2px; padding:6px; border-radius:7px; background:var(--tint); color:var(--accent); font-size:var(--quick-font); }
 #pin-menu { position:absolute; z-index:3; right:9px; padding:4px; border:1px solid var(--border); border-radius:9px; background:var(--surface); box-shadow:0 3px 12px #2d1f1030; }
@@ -36,3 +33,18 @@ button { font:inherit; cursor:pointer; }
 :root[data-side="left"] #quick-drop-hint { inset:0 0 0 5px; border-left:2px dashed var(--accent); border-right:0; border-radius:17px 0 0 17px; }
 :root[data-drag-ready="true"] #quick-drop-hint { display:flex; }
 :root[data-drag-over="true"] #quick-drop-hint { background:var(--accent); color:var(--surface); border-color:var(--surface); }
+
+/* 仅当前卡片展开，行高及邻居锚点固定；超长标题在当前卡片内换行展示。 */
+/* 内端锚定主窗口，悬停向外展开；行高固定，其他标签不跳位。 */
+#pin-list{align-items:flex-start}.pin-row,.pin-card{width:var(--compact-width,80px)}
+.pin-card.hover-expanded{left:0;right:auto}:root[data-side="left"] #pin-list{align-items:flex-end}:root[data-side="left"] .pin-card.hover-expanded{left:auto;right:0}
+/* 内端固定，只有当前标签向外展开；菜单字号独立于标签标题。 */
+:root{--menu-font:12px}:root[data-font-size="small"]{--menu-font:11px}:root[data-font-size="large"]{--menu-font:13px}
+#pin-list{padding:2px 0;display:flex;flex-direction:column;align-items:flex-start;overflow-x:hidden}
+.pin-row{width:var(--compact-width,80px);height:48px;flex:none;position:relative;margin-bottom:6px}
+.pin-card{width:var(--compact-width,80px);height:48px;min-height:48px;white-space:nowrap;overflow:hidden;padding:9px 8px}
+.pin-card.hover-expanded{position:absolute;left:0;right:auto;top:0;width:var(--hover-width,80px);height:auto;min-height:48px;max-height:240px;overflow:auto;white-space:normal;z-index:4;overflow-wrap:anywhere}
+:root[data-side="left"] #pin-list{padding:2px 0;align-items:flex-end}:root[data-side="left"] .pin-card.hover-expanded{left:auto;right:0}
+#pin-menu{right:auto;width:max-content;max-width:100%;font-size:var(--menu-font);line-height:1.4;padding:3px;border-radius:7px;z-index:8}
+#pin-remove{font:inherit;padding:5px 8px;min-height:26px;border:0;border-radius:4px}
+#pin-remove:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}

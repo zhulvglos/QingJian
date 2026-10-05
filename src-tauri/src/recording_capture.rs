@@ -142,3 +142,12 @@ pub fn recover_sessions(app:&tauri::AppHandle)->Result<(),String>{
         assert_eq!(fs::read(&path).unwrap(),before);assert_eq!(hound::WavReader::open(&path).unwrap().duration(),160);fs::remove_file(path).unwrap();fs::remove_dir(dir).unwrap();
     }
 }
+
+#[tauri::command]
+pub fn get_recording_inputs(app:tauri::AppHandle)->Result<Value,String>{crate::audio::setting(&app,"recording_inputs")}
+#[tauri::command]
+pub fn save_recording_inputs(app:tauri::AppHandle,mic_device:String,system_device:String,mode:String)->Result<(),String>{
+ if audio::active()||audio::processing(){return Err("录音或处理过程中不能修改录音配置".into());}
+ if mic_device.len()>2048||system_device.len()>2048||!["local","online"].contains(&mode.as_str()){return Err("录音配置无效".into());}
+ crate::audio::save_setting(&app,"recording_inputs",&json!({"micDevice":mic_device,"systemDevice":system_device,"mode":mode}))
+}

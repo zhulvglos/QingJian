@@ -11,6 +11,9 @@ struct Control{id:String,cancel:Arc<AtomicBool>,phase:&'static str,files:Vec<Fil
 fn control()->&'static Mutex<Control>{static STATE:OnceLock<Mutex<Control>>=OnceLock::new();STATE.get_or_init(||Mutex::new(Control{id:String::new(),cancel:Arc::new(AtomicBool::new(false)),phase:"idle",files:vec![],cancelled_ids:HashSet::new()}))}
 fn check(c:&AtomicBool)->Result<(),String>{if c.load(Ordering::SeqCst){Err("已取消导入解析，未写入数据".into())}else{Ok(())}}
 pub fn saving()->bool{control().lock().map(|s|s.phase=="saving").unwrap_or(true)}
+pub struct ExternalSaveGuard;
+impl Drop for ExternalSaveGuard{fn drop(&mut self){if let Ok(mut s)=control().lock(){if s.id=="news-collection"{s.phase="done";s.id.clear();}}}}
+pub fn begin_external_save()->Result<ExternalSaveGuard,String>{let mut s=control().lock().map_err(|_|"保存状态不可用")?;if matches!(s.phase,"saving"|"parsing"|"ready"){return Err("请先完成或取消当前导入".into());}s.id="news-collection".into();s.phase="saving";Ok(ExternalSaveGuard)}
 pub fn cancel(){if let Ok(mut s)=control().lock(){if s.phase!="saving"{s.cancel.store(true,Ordering::SeqCst);s.files.clear();s.phase="cancelled";}}}
 fn error_file(path:&str)->FilePreview{let p=Path::new(path);FilePreview{id:uuid::Uuid::new_v4().to_string(),file_name:p.file_name().unwrap_or_default().to_string_lossy().into(),format:p.extension().unwrap_or_default().to_string_lossy().to_lowercase(),entries:vec![],warnings:vec![],error:None,fields:vec![],can_map:false,can_as_text:false,raw_json:None}}
 fn bounded_read(path:&Path,c:&AtomicBool)->Result<Vec<u8>,String>{
@@ -60,7 +63,7 @@ fn response(s:&Control)->Value{json!({"requestId":s.id,"files":s.files})}
 #[tauri::command]
 pub async fn choose_document_files(app:tauri::AppHandle)->Result<Option<Vec<String>>,String>{
  let directory=app.state::<crate::data_root::DataRoot>().0.clone();
- tauri::async_runtime::spawn_blocking(move||rfd::FileDialog::new().set_directory(directory).set_title("选择要导入的普通文档").add_filter("普通文档",&["txt","md","markdown","docx","json"]).pick_files().map(|p|p.into_iter().map(|p|p.to_string_lossy().to_string()).collect())).await.map_err(|_|"文件选择器不可用".into())
+ tauri::async_runtime::spawn_blocking(move||crate::native_dialog::run(move||rfd::FileDialog::new().set_directory(directory).set_title("选择要导入的文件").add_filter("文档和轻笺备份",&["txt","md","markdown","docx","json","qjbackup"]).pick_files().map(|p|p.into_iter().map(|p|p.to_string_lossy().to_string()).collect()))).await.map_err(|_|"文件选择器不可用".to_string())?
 }
 #[tauri::command]
 pub async fn preview_documents(request_id:String,paths:Vec<String>)->Result<Value,String>{

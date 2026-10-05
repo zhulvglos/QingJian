@@ -24,7 +24,7 @@ fn valid_preferences(p:&Value)->Result<(),String>{
     for(k,allowed)in [("audioConfig",vec!["root","exe","model","engine","sensePython","senseRuntime","senseModels"]),("onlineAudio",vec!["endpoint","model"]),("onlineText",vec!["endpoint","model"])]{if let Some(v)=p.get(k){let o=v.as_object().ok_or("模型设置格式错误")?;if o.iter().any(|(key,val)|!allowed.contains(&key.as_str())||!val.is_string()){return Err("备份模型设置含未知字段或凭据".into());}}}
     if !["mint_morning","new_leaf","warm_apricot","coral","lilac_mist"].contains(&p["theme"].as_str().unwrap_or("")){return Err("备份主题无效".into());}
     if !["small","standard","large"].contains(&p["fontSize"].as_str().unwrap_or("")){return Err("备份字号无效".into());}
-    if let Some(w)=p.get("window") {let o=w.as_object().ok_or("窗口设置格式错误")?;for(k,v)in o {if !["alwaysOnTop","edgeHide","autoStart","x","y","height"].contains(&k.as_str()){return Err("不支持的窗口设置".into());} if ["alwaysOnTop","edgeHide","autoStart"].contains(&k.as_str())&&!v.is_boolean(){return Err("窗口开关值无效".into());}}}
+    if let Some(w)=p.get("window") {let o=w.as_object().ok_or("窗口设置格式错误")?;for(k,v)in o {if !["alwaysOnTop","edgeHide","autoStart","x","y","height","transparency"].contains(&k.as_str()){return Err("不支持的窗口设置".into());} if k=="transparency"&&v.as_u64().is_none_or(|n|n>70||n%5!=0){return Err("窗口透明度无效".into());} if ["alwaysOnTop","edgeHide","autoStart"].contains(&k.as_str())&&!v.is_boolean(){return Err("窗口开关值无效".into());}}}
     Ok(())
 }
 pub(crate) fn snapshot(conn:&Connection, preferences:Value)->Result<Backup,String>{
@@ -38,7 +38,7 @@ pub(crate) fn snapshot(conn:&Connection, preferences:Value)->Result<Backup,Strin
     }
     let mut settings=preferences;
     let raw:Option<String>=tx.query_row("SELECT value FROM app_settings WHERE key='window'",[],|r|r.get(0)).ok();
-    if let Some(raw)=raw {if let Ok(w)=serde_json::from_str::<Value>(&raw){let mut safe=serde_json::Map::new();for k in ["alwaysOnTop","edgeHide","autoStart","x","y","height"] {if let Some(v)=w.get(k){safe.insert(k.into(),v.clone());}} settings["window"]=Value::Object(safe);}}
+    if let Some(raw)=raw {if let Ok(w)=serde_json::from_str::<Value>(&raw){let mut safe=serde_json::Map::new();for k in ["alwaysOnTop","edgeHide","autoStart","x","y","height","transparency"] {if let Some(v)=w.get(k){safe.insert(k.into(),v.clone());}} settings["window"]=Value::Object(safe);}}
     // 仅备份公开配置，不导出密钥、测试通过标志或历史请求内容。
     for(db_key,out_key,fields)in [("audio_config","audioConfig",vec!["root","engine","sensePython","senseRuntime","senseModels"]),("online_audio","onlineAudio",vec!["endpoint","model"]),("online_text","onlineText",vec!["endpoint","model"])]{if let Ok(raw)=tx.query_row("SELECT value FROM app_settings WHERE key=?1",[db_key],|r|r.get::<_,String>(0)){if let Ok(v)=serde_json::from_str::<Value>(&raw){let mut safe=serde_json::Map::new();for field in fields{if let Some(value)=v[field].as_str(){safe.insert(field.into(),json!(value));}}if out_key=="audioConfig"{safe.insert("engine".into(),json!("sensevoice"));}settings[out_key]=json!(safe);}}}
     tx.commit().map_err(err)?;
@@ -66,14 +66,18 @@ fn validate(b:&Backup)->Result<(),String>{
     // 提醒归属、唯一当前发生记录、固定关系由同一内存库外键和唯一约束验证。
     Ok(())
 }
-fn read(path:&str)->Result<Backup,String>{
+pub(crate) fn read(path:&str)->Result<Backup,String>{
     let p=Path::new(path);if p.extension().and_then(|x|x.to_str())!=Some("qjbackup"){return Err("请选择 .qjbackup 文件".into());}
     if std::fs::metadata(p).map_err(err)?.len()>50_000_000{return Err("备份文件超过 50MB 上限".into());}
     let b:Backup=serde_json::from_slice(&std::fs::read(p).map_err(err)?).map_err(|e|format!("备份格式无效：{e}"))?;validate(&b)?;Ok(b)
 }
-fn write(path:&Path,b:&Backup)->Result<(),String>{
+pub(crate) fn write(path:&Path,b:&Backup)->Result<(),String>{
+    let bytes=serde_json::to_vec_pretty(b).map_err(err)?;
+    // 与读取上限一致：超限在创建文件前拒绝，避免周期失败留下大文件并耗尽磁盘。
+    if bytes.len()>50_000_000{return Err("内容备份超过 50MB 上限，未创建文件；请减少附件文本或分批导出".into());}
+    validate(b)?;
     let tmp=path.with_extension(format!("{}.tmp",uuid::Uuid::new_v4()));
-    let result=(||{use std::io::Write;let mut f=std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(err)?;f.write_all(&serde_json::to_vec_pretty(b).map_err(err)?).map_err(err)?;f.sync_all().map_err(err)?;drop(f);std::fs::rename(&tmp,path).map_err(|e|format!("写入备份失败（请选择新文件名）：{e}"))})();
+    let result=(||{use std::io::Write;let mut f=std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(err)?;f.write_all(&bytes).map_err(err)?;f.sync_all().map_err(err)?;drop(f);std::fs::rename(&tmp,path).map_err(|e|format!("写入备份失败（请选择新文件名）：{e}"))})();
     if result.is_err(){let _=std::fs::remove_file(&tmp);}result
 }
 // 普通文档导入只复用内容快照，不接入备份恢复的外部 ID 或冲突覆盖流程。
@@ -85,7 +89,7 @@ pub(crate) fn before_document_import(conn:&Connection,preferences:Value,root:&Pa
 }
 #[tauri::command]
 pub async fn choose_backup_path(save:bool)->Result<Option<String>,String>{
-    tauri::async_runtime::spawn_blocking(move||{let d=rfd::FileDialog::new().add_filter("轻笺备份",&["qjbackup"]);let p=if save{d.set_file_name(format!("轻笺备份-{}.qjbackup",chrono::Local::now().format("%Y%m%d-%H%M%S"))).save_file()}else{d.pick_file()};p.map(|p|p.to_string_lossy().to_string())}).await.map_err(err)
+    tauri::async_runtime::spawn_blocking(move||crate::native_dialog::run(move||{let d=rfd::FileDialog::new().add_filter("轻笺备份",&["qjbackup"]);let p=if save{d.set_file_name(format!("轻笺备份-{}.qjbackup",chrono::Local::now().format("%Y%m%d-%H%M%S"))).save_file()}else{d.pick_file()};p.map(|p|p.to_string_lossy().to_string())})).await.map_err(err)?
 }
 #[tauri::command]
 pub fn export_backup(path:String,preferences:Value,selected_ids:Option<Vec<String>>,include_settings:Option<bool>,database:tauri::State<'_,Database>)->Result<String,String>{
@@ -93,7 +97,7 @@ pub fn export_backup(path:String,preferences:Value,selected_ids:Option<Vec<Strin
     let conn=database.0.lock().map_err(err)?;let mut b=snapshot(&conn,preferences)?;drop(conn);select_items(&mut b,selected_ids)?;if include_settings==Some(false){b.settings=Value::Null;}b.checksum=checksum(&b);write(Path::new(&path),&b)?;Ok(path)
 }
 // 所选主记录向下筛选关系，绝不将未选内容随关联一起带出。
-fn select_items(b:&mut Backup,ids:Option<Vec<String>>)->Result<(),String>{
+pub(crate) fn select_items(b:&mut Backup,ids:Option<Vec<String>>)->Result<(),String>{
     let Some(ids)=ids else{return Ok(())};let ids:HashSet<String>=ids.into_iter().collect();
     if ids.iter().any(|id|!b.tables["items"].iter().any(|r|r[0].as_str()==Some(id))){return Err("所选条目已变化，请重新读取清单".into());}
     b.tables.get_mut("items").unwrap().retain(|r|ids.contains(r[0].as_str().unwrap_or("")));
@@ -102,6 +106,10 @@ fn select_items(b:&mut Backup,ids:Option<Vec<String>>)->Result<(),String>{
     let reminder_ids:HashSet<String>=b.tables["reminders"].iter().filter_map(|r|r[0].as_str().map(str::to_owned)).collect();
     b.tables.get_mut("reminder_occurrences").unwrap().retain(|r|reminder_ids.contains(r[1].as_str().unwrap_or("")));Ok(())
 }
+pub(crate) fn selected_bytes(mut b:Backup,settings:bool)->Result<Vec<u8>,String>{if !settings{b.settings=Value::Null;}b.checksum=checksum(&b);validate(&b)?;let bytes=serde_json::to_vec_pretty(&b).map_err(err)?;if bytes.len()>50_000_000{return Err("所选备份超过 50MB 上限，请分批导出".into());}Ok(bytes)}
+pub(crate) fn content_fingerprint(b:&Backup)->String{format!("{:x}",Sha256::digest(serde_json::to_vec(&(&b.tables,&b.settings)).unwrap()))}
+pub(crate) fn item_count(b:&Backup)->usize{b.tables["items"].len()}
+pub(crate) fn set_created_at(b:&mut Backup,time:String){b.created_at=time;b.checksum=checksum(b);}
 fn entries(b:&Backup,conn:&Connection)->Result<Vec<Value>,String>{b.tables["items"].iter().map(|r|{let conflict=conn.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE id=?1)",[r[0].as_str().unwrap_or("")],|r|r.get::<_,bool>(0)).map_err(err)?;Ok(json!({"id":r[0],"kind":r[1],"title":r[2],"updatedAt":r[6],"deleted":!r[7].is_null(),"conflict":conflict}))}).collect()}
 #[tauri::command]
 pub fn backup_entries(preferences:Value,database:tauri::State<'_,Database>)->Result<Vec<Value>,String>{let c=database.0.lock().map_err(err)?;entries(&snapshot(&c,preferences)?,&c)}
@@ -114,6 +122,9 @@ pub fn preview_backup(path:String,database:tauri::State<'_,Database>)->Result<Va
     Ok(json!({"checksum":b.checksum,"createdAt":b.created_at,"entries":entries(&b,&conn)?,"items":b.tables["items"].len(),"trash":b.tables["items"].iter().filter(|r|!r[7].is_null()).count(),"pins":b.tables["pins"].len(),"reminders":b.tables["reminders"].len(),"occurrences":b.tables["reminder_occurrences"].len(),"conflicts":conflicts,"identical":identical,"settings":b.settings}))
 }
 pub(crate) fn merge(conn:&mut Connection,b:&Backup,policy:&str)->Result<usize,String>{
+    merge_with_settings(conn,b,policy,&[])
+}
+fn merge_with_settings(conn:&mut Connection,b:&Backup,policy:&str,settings:&[(String,Value)])->Result<usize,String>{
     if !["skip","replace"].contains(&policy){return Err("必须明确选择跳过或替换相同 ID 内容".into());}
     let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(err)?;let mut accepted=HashSet::new();
     for r in &b.tables["items"]{let id=r[0].as_str().ok_or("ID 错误")?;let exists=tx.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE id=?1)",[id],|r|r.get::<_,bool>(0)).map_err(err)?;
@@ -124,24 +135,43 @@ pub(crate) fn merge(conn:&mut Connection,b:&Backup,policy:&str)->Result<usize,St
     for r in &b.tables["pins"] {if accepted.contains(r[0].as_str().unwrap_or("")){insert(&tx,"pins",TABLES[1].1,r)?;}}
     for r in &b.tables["reminders"] {if accepted.contains(r[1].as_str().unwrap_or("")){insert(&tx,"reminders",TABLES[2].1,r)?;reminders.insert(r[0].as_str().unwrap_or("").to_string());}}
     for r in &b.tables["reminder_occurrences"] {if reminders.contains(r[1].as_str().unwrap_or("")){insert(&tx,"reminder_occurrences",TABLES[3].1,r)?;}}
+    // 内容和公开配置共用同一事务，任意数据库写入失败整批回滚。
+    for(key,value)in settings{tx.execute("INSERT INTO app_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,value.to_string()]).map_err(err)?;}
     tx.commit().map_err(err)?;Ok(accepted.len())
 }
 #[tauri::command]
-pub fn import_backup(path:String,expected_checksum:String,policy:String,preferences:Value,selected_ids:Option<Vec<String>>,app:tauri::AppHandle)->Result<Value,String>{
+pub fn import_backup(path:String,expected_checksum:String,policy:String,preferences:Value,selected_ids:Option<Vec<String>>,apply_settings:Option<bool>,app:tauri::AppHandle)->Result<Value,String>{
     let mut b=read(&path)?;if b.checksum!=expected_checksum{return Err("文件在预览后发生变化，请重新预览".into());}select_items(&mut b,selected_ids)?;
-    let db=app.state::<Database>();let mut conn=db.0.lock().map_err(err)?;
-    let before=snapshot(&conn,preferences)?;
+    let apply=apply_settings==Some(true)&&!b.settings.is_null();
+    let mut settings=if apply{prepare_media(&b.settings,&app)?}else{vec![]};
+    if apply{settings.push(("appearance".into(),json!({"theme":b.settings["theme"],"fontSize":b.settings["fontSize"]})));}
+    let old_window=if apply{Some(serde_json::to_value(crate::shell::get_shell_settings(app.clone())?).map_err(err)?)}else{None};
+    let db=app.state::<Database>();let before={let conn=db.0.lock().map_err(err)?;snapshot(&conn,preferences)?};
     let dir=app.state::<crate::data_root::DataRoot>().0.join("backups");std::fs::create_dir_all(&dir).map_err(err)?;
     let backup=dir.join(format!("导入前-{}.qjbackup",uuid::Uuid::new_v4()));write(&backup,&before)?;
-    let count=merge(&mut conn,&b,&policy)?;drop(conn);
+    if apply{crate::online::cancel_tests();crate::model_news::cancel();}
+    if apply{if let Some(window)=b.settings.get("window"){if let Err(error)=crate::shell::apply_backup_window(app.clone(),window.clone()){if let Some(old)=old_window.clone(){let _=crate::shell::apply_backup_window(app.clone(),old);}return Err(format!("窗口设置应用失败，内容未写入：{error}"));}}}
+    let result={let mut conn=db.0.lock().map_err(err)?;merge_with_settings(&mut conn,&b,&policy,&settings)};
+    let count=match result{Ok(n)=>n,Err(error)=>{if let Some(old)=old_window{let _=crate::shell::apply_backup_window(app.clone(),old);}return Err(format!("恢复已回滚：{error}"));}};
     let _=app.emit_to("quick","quick-items-changed",true);
-    Ok(json!({"imported":count,"skipped":b.tables["items"].len()-count,"backupPath":backup,"settings":b.settings}))
+    Ok(json!({"imported":count,"skipped":b.tables["items"].len()-count,"backupPath":backup,"settings":b.settings,"settingsApplied":apply}))
 }
+fn prepare_media(settings:&Value,app:&tauri::AppHandle)->Result<Vec<(String,Value)>,String>{
+ valid_preferences(settings)?;if crate::audio::active()||crate::audio::processing()||crate::online::processing(){return Err("请先完成录音或正式模型任务，再应用全局设置；内容未写入".into());}let mut updates=vec![];
+ if let Some(config)=settings.get("audioConfig"){let mut c=config.clone();for key in ["root","sensePython","senseRuntime","senseModels"]{if let Some(path)=c[key].as_str().filter(|s|!s.is_empty()){if !Path::new(path).is_absolute()||path.to_ascii_lowercase().starts_with("c:"){return Err("备份的语音资源路径必须位于非 C 盘；内容未写入".into());}}}if c["root"].as_str().unwrap_or("").is_empty(){return Err("备份的语音资源保存目录缺失；内容未写入".into());}crate::sensevoice::defaults(&mut c);updates.push(("audio_config".into(),c));updates.push(("audio_validation".into(),json!({})));}
+ for (out,key)in [("onlineAudio","online_audio"),("onlineText","online_text")]{if let Some(config)=settings.get(out){let endpoint=config["endpoint"].as_str().unwrap_or("").trim_end_matches('/');let url=reqwest::Url::parse(endpoint).map_err(|_|"备份的模型地址无效；内容未写入")?;let local=std::env::var_os("QINGJIAN_TEST_MODE").is_some()&&url.scheme()=="http"&&matches!(url.host_str(),Some("localhost"|"127.0.0.1"));if (url.scheme()!="https"&&!local)||!url.username().is_empty()||url.password().is_some()||url.query().is_some()||url.fragment().is_some()||config["model"].as_str().unwrap_or("").trim().is_empty(){return Err("备份模型连接配置无效；内容未写入".into());}let current=crate::audio::setting(app,key)?;validate_endpoint_restore(current["endpoint"].as_str(),endpoint)?;
+ // 不访问 Windows 凭据接口。地址不变时沿用原凭据；地址不同则在任何写入前拒绝，防止密钥误发。
+ updates.push((key.into(),json!({"endpoint":endpoint,"model":config["model"],"revision":uuid::Uuid::new_v4().to_string(),"tested":false,"testedAt":Value::Null})));}}
+ Ok(updates)
+}
+fn validate_endpoint_restore(current:Option<&str>,wanted:&str)->Result<(),String>{if current.filter(|s|!s.is_empty()).is_some_and(|s|s.trim_end_matches('/')!=wanted){Err("备份服务地址与当前地址不同。为保护系统凭据，请取消应用全局设置，恢复内容后在模型设置手动核对；未写入任何内容".into())}else{Ok(())}}
 #[tauri::command]
-pub fn apply_backup_media(settings:Value,app:tauri::AppHandle)->Result<(),String>{valid_preferences(&settings)?;if let Some(c)=settings.get("audioConfig"){crate::audio::save_audio_config(c.clone(),app.clone())?;}for(k,kind)in [("onlineAudio","audio"),("onlineText","text")]{if let Some(c)=settings.get(k){crate::online::save_online_config(kind.into(),c["endpoint"].as_str().unwrap_or("").into(),c["model"].as_str().unwrap_or("").into(),None,crate::online::online_config(kind.into(),app.clone())?["endpoint"]!=c["endpoint"],app.clone())?;}}Ok(())}
+pub fn apply_backup_media(settings:Value,app:tauri::AppHandle)->Result<(),String>{let updates=prepare_media(&settings,&app)?;crate::online::cancel_tests();crate::model_news::cancel();let db=app.state::<Database>();let mut c=db.0.lock().map_err(err)?;let tx=c.transaction().map_err(err)?;for(key,value)in updates{tx.execute("INSERT INTO app_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,value.to_string()]).map_err(err)?;}tx.commit().map_err(err)}
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]fn endpoint_restore_preserves_credential_identity(){assert!(validate_endpoint_restore(Some("https://example.test/v1/"),"https://example.test/v1").is_ok());assert!(validate_endpoint_restore(Some("https://example.test/v1"),"https://other.test/v1").is_err());assert!(validate_endpoint_restore(None,"https://example.test/v1").is_ok());}
+    #[test]fn configuration_failure_rolls_back_content(){let(mut c,mut b)=sample();b.tables.get_mut("items").unwrap()[0][2]=json!("不应提交");c.execute_batch("CREATE TRIGGER reject_appearance BEFORE INSERT ON app_settings WHEN NEW.key='appearance' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(merge_with_settings(&mut c,&b,"replace",&[("appearance".into(),json!({"theme":"warm_apricot","fontSize":"standard"}))]).is_err());assert_eq!(c.query_row("SELECT title FROM items",[],|r|r.get::<_,String>(0)).unwrap(),"保留标题");assert_eq!(c.query_row("SELECT count(*) FROM pins",[],|r|r.get::<_,i64>(0)).unwrap(),1);}
     #[test]fn local_engine_settings_survive_backup_without_credentials(){
         let (c,_)=sample();
         let config=json!({"root":"F:\\audio","exe":"F:\\whisper.exe","model":"F:\\base.bin","engine":"sensevoice","sensePython":"F:\\python.exe","senseRuntime":"F:\\runtime","senseModels":"F:\\models"});
