@@ -553,3 +553,16 @@ html,body,#root{background:transparent}.app-shell{background:transparent;box-sha
 .editor-panel:has(.title-edit) {overflow-y:auto}
 .title-display:focus-visible,.title-edit:focus {outline:2px solid var(--accent);outline-offset:1px}
 .reminder-editor {flex:1;min-height:0;max-height:none;align-content:start;overflow:auto}
+
+/* 账号设置沿用现有色彩和 12px 内容层级，保存状态与同步状态分别展示。 */
+.cloud-settings {font-size:12px;line-height:1.6;padding:12px;overflow-wrap:anywhere;}
+.cloud-settings h2 {font-size:16px;margin:0 0 8px;}
+.cloud-settings h3 {font-size:13px;margin:0 0 6px;}
+.cloud-settings section,.cloud-settings details {padding:12px 0;border-bottom:1px solid var(--line,#ddd);}
+.cloud-settings label {display:block;margin:10px 0;}
+.cloud-settings input {display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px;border:1px solid var(--line,#ddd);border-radius:8px;font:inherit;background:transparent;color:inherit;}
+.cloud-settings button,.cloud-inline-status button {font:inherit;margin:4px;padding:5px 8px;border:1px solid var(--line,#ddd);border-radius:7px;background:transparent;color:inherit;cursor:pointer;}
+.cloud-settings button:disabled {opacity:.5;cursor:default;}
+.cloud-inline-status {display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;padding:0 8px;min-height:29px;}
+.cloud-restart-block {z-index:10000;}
+.secondary-nav.settings-tabs {grid-template-columns:repeat(5,minmax(0,1fr));overflow-x:auto;}

@@ -17,6 +17,7 @@ import {readDocument,documentText} from './rich_document';
 import {useRunScroll,setRunValue} from './run_session';
 import type { Draft, Item, ItemKind, ItemView, Reminder } from './item_workspace';
 import './style.css';
+import {CloudSettings,syncLabel,type CloudStatus} from './cloud_settings';
 import {NavIcon} from './ui_icons';
 import {applyBackgroundTransparency} from './background';
 const brandIcon = new URL('./assets/qingjian-brand.svg', import.meta.url).href;
@@ -52,7 +53,7 @@ const subnav: Record<Section, string[]> = {
   news: ['AI 新闻', '模型资讯'],
   stickies: ['+ 新建', '待办', '已完成', '回收站'],
   notes: ['+ 新建', '待办', '已完成', '回收站'],
-  settings: ['通用', '文件', '模型', '语音'],
+  settings: ['通用', '账号', '文件', '模型', '语音'],
 };
 const defaultSubnav: Record<Section, string> = {
   news: 'AI 新闻', stickies: '+ 新建', notes: '+ 新建', settings: '通用',
@@ -123,6 +124,11 @@ function App() {
   const [saveError, setSaveError] = useState('');
   const [actionError, setActionError] = useState('');
   const [tasks,setTasks]=useState<TaskSnapshot|null>(null);
+  const [accountBusy,setAccountBusy]=useState(false);
+  useEffect(()=>{const update=(e:Event)=>setAccountBusy((e as CustomEvent<boolean>).detail);window.addEventListener('cloud-transition-busy',update);return()=>window.removeEventListener('cloud-transition-busy',update);},[]);
+  const [cloudStatus,setCloudStatus]=useState<CloudStatus|null>(null);
+  const refreshCloud=async()=>{setCloudStatus(await invoke<CloudStatus>('cloud_status'));};
+  useEffect(()=>{void refreshCloud().catch(()=>{});const timer=setInterval(()=>void refreshCloud().catch(()=>{}),1500);return()=>clearInterval(timer);},[]);
   const [status, setStatus] = useState('');
   const [saving, setSaving] = useState(false);
   const [importKind,setImportKind]=useState<ItemKind|null>(null),[importSaving,setImportSaving]=useState(false);
@@ -161,7 +167,9 @@ function App() {
     void emitTo('quick', 'shell-appearance', { theme, fontSize });
   }, [fontSize]);
 
+  const reloadSerial=useRef(0);
   const reload = async () => {
+    const serial=++reloadSerial.current;
     setLoading(true); setDataError('');
     try {
       const [sticky, note, stickyTrash, noteTrash, allReminders] = await Promise.all([
@@ -169,17 +177,19 @@ function App() {
         invoke<Item[]>('list_trashed', { kind: 'sticky' }), invoke<Item[]>('list_trashed', { kind: 'note' }),
         invoke<Reminder[]>('list_reminders'),
       ]);
+      if(serial!==reloadSerial.current)return;
       setItems({ sticky, note });
       setTrashed({ sticky: stickyTrash, note: noteTrash });
       setReminders(allReminders);
-    } catch (error) { setDataError(String(error)); }
-    finally { setLoading(false); }
+      void refreshCloud().catch(()=>{});
+    } catch (error) { if(serial===reloadSerial.current)setDataError(String(error)); }
+    finally { if(serial===reloadSerial.current)setLoading(false); }
   };
-  useEffect(() => { void reload(); const p=listen('content-collected',()=>void reload()); return ()=>{void p.then(f=>f());}; }, []);
+  useEffect(() => { void reload(); const p=listen('content-collected',()=>void reload()); const sync=listen('cloud-content-changed',()=>{void reload();void refreshCloud();}); return ()=>{void p.then(f=>f());void sync.then(f=>f());}; }, []);
   useEffect(()=>{
     if(loading)return;
     // 删除或导入后安全回退；检查只随实际列表更新，不因编辑草稿自动提交或保存。
-    setDrafts(previous=>{let changed=false;const next={...previous};for(const k of ['sticky','note'] as const){const d=previous[k];if(d?.id&&!items[k].some(i=>i.id===d.id)){next[k]=null;changed=true;}}return changed?next:previous;});
+    setDrafts(previous=>{let changed=false;const next={...previous};for(const k of ['sticky','note'] as const){const d=previous[k];if(!d?.id||dirtyDraft(d))continue;const item=items[k].find(i=>i.id===d.id);if(!item){next[k]=null;changed=true;}else if(item.revision!==d.revision){next[k]={remoteGeneration:(d.remoteGeneration||0)+1,id:item.id,kind:item.kind,title:item.title,body:item.body,bodyJson:item.bodyJson,updatedAt:item.updatedAt,revision:item.revision,savedTitle:item.title,savedBody:item.body,savedBodyJson:item.bodyJson};changed=true;}}return changed?next:previous;});
   },[items,loading]);
   useEffect(() => {
     if (!status) return;
@@ -230,7 +240,7 @@ function App() {
     update();const timer=window.setInterval(update,250);return()=>window.clearInterval(timer);
   },[anyDirty,pending,deleteConfirm,bellOpen,saving]);
   const requestAction = (action: LeaveAction) => {
-    if (saving || importSaving || pending || audioPending) return;
+    if (accountBusy || cloudStatus?.restartRequired || saving || importSaving || pending || audioPending) return;
     if(recording&&(action.type==='hide'||action.type==='quit')){setRecordLeave(action);return;}
     if (action.type === 'section' && action.section === section) return;
     if (action.type === 'tab' && action.tab === tab) return;
@@ -261,14 +271,14 @@ function App() {
     return () => { active = false; unlisteners.forEach((fn) => fn()); };
   }, []);
   const save = async (after?: LeaveAction) => {
-    if (!draft || saving) return;
+    if (!draft || saving || accountBusy || cloudStatus?.restartRequired) return;
     setSaving(true); setSaveError(''); setStatus('');
     try {
       // 只有这一处调用数据库写入；编辑输入始终先停留在内存草稿。
       const item = await invoke<Item>('save_item', { input: { id: draft.id ?? null, kind: draft.kind, title: draft.title, body: draft.body, bodyJson: draft.bodyJson, revision: draft.revision ?? null } });
-      setDraft({ id: item.id, kind: item.kind, title: item.title, body: item.body, bodyJson: item.bodyJson, updatedAt: item.updatedAt, revision: item.revision, savedTitle: item.title, savedBody: item.body, savedBodyJson: item.bodyJson });
+      setDraft({ remoteGeneration:draft.remoteGeneration, id: item.id, kind: item.kind, title: item.title, body: item.body, bodyJson: item.bodyJson, updatedAt: item.updatedAt, revision: item.revision, savedTitle: item.title, savedBody: item.body, savedBodyJson: item.bodyJson });
       await reload();
-      setStatus('已保存');
+      setStatus('已保存到本机'); void refreshCloud();
       void emitTo('quick', 'quick-items-changed', true);
       if (after) {
         setPending(null);
@@ -388,6 +398,8 @@ function App() {
       <p className="bell-footnote">当前可设置单次提醒；系统通知与周期规则待接入。</p>
     </div>}
 
+    {accountBusy&&<div className="dialog-backdrop cloud-restart-block"><section className="leave-dialog" role="dialog" aria-label="正在变更会话"><p>正在变更会话，请稍候…</p></section></div>}
+    {cloudStatus?.restartRequired&&<div className="dialog-backdrop cloud-restart-block"><section className="leave-dialog" role="dialog" aria-label="账号切换完成"><h2>请重启轻笺</h2><p>账号已变更，旧工作区同步已停止。重启后进入所选工作区。</p><button onClick={()=>void invoke('cloud_restart').catch(e=>setActionError(String(e)))}>重启轻笺</button>{actionError&&<p role="alert">{actionError}</p>}</section></div>}
     <nav className="primary-nav" aria-label="主导航">
       {sections.map((item) => <button key={item.id} title={item.label} aria-label={item.label} className={section === item.id ? 'active' : ''} onClick={() => requestAction({ type: 'section', section: item.id })}>{item.label}</button>)}
     </nav>
@@ -403,6 +415,8 @@ function App() {
         {tab==='AI 新闻'?<NewsPanel onView={id=>void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'item',item}))}/>:<FreeApiPanel onView={id=>void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'item',item}))}/>}
       </section>}
       {showItemWorkspace && <div className="items-stage">
+        <div className="cloud-inline-status" role="status"><span>{syncLabel(cloudStatus)}</span><button onClick={()=>navigate('settings','账号')}>账号</button></div>
+        {draft?.id&&isDirty&&!items[draft.kind].some(i=>i.id===draft.id&&i.revision===draft.revision)&&<div className="operation-error" role="alert">云端内容已变化，未保存草稿仍保留。<button onClick={()=>{setDraft(current=>current?{...current,id:undefined,revision:undefined,title:current.title+'（草稿副本）',savedTitle:'',savedBody:'',savedBodyJson:null}:null);setSaveError('');}}>另存草稿副本</button></div>}
 
         {actionError && <div className="operation-error" role="alert">{actionError}</div>}
         <ItemWorkspace key={section} kind={section === 'stickies' ? 'sticky' : 'note'} view={tab as ItemView} items={items[section === 'stickies' ? 'sticky' : 'note']} trashed={trashed[section === 'stickies' ? 'sticky' : 'note']} reminders={reminders} draft={draft?.kind === (section === 'stickies' ? 'sticky' : 'note') ? draft : null} editorSession={editorSession} loading={loading} error={dataError} saveError={saveError} status={status} onSelect={(item) => requestAction({ type: 'item', item })}
@@ -413,7 +427,8 @@ function App() {
       </div>}
       <div className="recording-overlay" hidden={!audioOpen} role={audioOpen?'dialog':undefined} aria-label="录音工作区"><div className="recording-overlay-heading"><span>录音与转写</span><button onClick={()=>setAudioOpen(false)}>收起</button></div><AudioPanel guardRef={audioGuard} open={audioOpen} onActive={setRecording} notes={items.note} onConfigure={next=>{setAudioOpen(false);requestAction({type:'configure',tab:next});}} onDraft={(text,item)=>{setAudioOpen(false);requestAction({type:'transcript',text,item});}}/></div>
       {section === 'settings' && <section className="settings-stage">
-        {tab === '通用' ? <>
+        {actionError&&<p className="operation-error" role="alert">{actionError}</p>}
+        {tab === '账号' ? <CloudSettings status={cloudStatus} onRefresh={refreshCloud} canChange={()=>anyDirty||!!firstReminderDraft()||audioGuard.current?.dirty()?'请先保存或处理所有未保存的正文、提醒和转写草稿。':saving||importSaving||recording||tasks?.audio.status==='running'||tasks?.formalOnline.status==='running'?'请先结束保存、导入、录音或处理任务。':''} onOpen={id=>void invoke<Item>('get_item',{id}).then(item=>requestAction({type:'pin',item})).catch(e=>setActionError(String(e)))}/> : tab === '通用' ? <>
           <div className="settings-heading"><span className="settings-kicker">外观</span><h1>选择轻笺的色彩</h1><p>五套皮肤来自 PRD 指定色卡，首次启动使用暖杏。</p></div>
           <div className="theme-list" aria-label="皮肤选择">
             {themes.map((option) => <button key={option.id} className={'theme-option ' + (theme === option.id ? 'selected' : '')} onClick={() => setTheme(option.id)}>

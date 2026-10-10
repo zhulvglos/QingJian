@@ -11,7 +11,7 @@ import {markReminderDraft} from './reminder_drafts';
 
 export type ItemKind = 'sticky' | 'note';
 export type Item = { id: string; kind: ItemKind; title: string; body: string; bodyJson: string | null; createdAt: string; updatedAt: string; revision: number; isPinned: boolean; sortOrder: number };
-export type Draft = { id?: string; kind: ItemKind; title: string; body: string; bodyJson: string | null; updatedAt?: string; revision?: number; savedTitle: string; savedBody: string; savedBodyJson: string | null };
+export type Draft = { remoteGeneration?: number; id?: string; kind: ItemKind; title: string; body: string; bodyJson: string | null; updatedAt?: string; revision?: number; savedTitle: string; savedBody: string; savedBodyJson: string | null };
 export type ItemView = '+ 新建' | '待办' | '已完成' | '回收站';
 export type Reminder = { occurrenceId: string; itemId: string; kind: ItemKind; title: string; dueAt: string; status: 'pending' | 'completed'; completedAt: string | null; isCurrent: boolean };
 
@@ -276,7 +276,7 @@ export function ItemWorkspace({ kind, view, items, trashed, reminders, draft, ed
           if (okay) { reminderSaved(); setReminderError(''); } else setReminderError('保存提醒失败，请重试');
         }}>保存提醒</button>{activeReminder && <button type="button" disabled={reminderBusy} onClick={async () => { if (!draft.id) return; setReminderBusy(true); const okay = await onCancelReminder(draft.id); setReminderBusy(false); if (okay) { reminderSaved(); setReminderError(''); } else setReminderError('取消提醒失败，请重试'); }}>取消提醒</button>}</div>{reminderError && <small role="alert" className="error-text">{reminderError}</small>}</div>}
         {toolsTarget&&<BodyViewToolsPortal target={toolsTarget} mode={mode} onMode={setMode}/>}
-        <RichBodyEditor key={editorSession} body={draft.body} bodyJson={draft.bodyJson} onChange={onBodyChange} mode={mode} />
+        <RichBodyEditor key={editorSession+':'+(draft.remoteGeneration||0)} body={draft.body} bodyJson={draft.bodyJson} onChange={onBodyChange} mode={mode} />
         {(saveError || status) && <div className={'detail-feedback ' + (saveError ? 'error-text' : '')} role="status">{saveError ? `保存失败：${saveError}` : status}</div>}
       </>}
     </section>}

@@ -11,6 +11,8 @@ use sensevoice_install::install_sensevoice;
 
 mod quick_window;
 mod database;
+mod sync_store;
+mod cloud;
 mod data_root;
 mod shell;
 mod news;
@@ -119,7 +121,9 @@ fn show_main(app: &tauri::AppHandle) {
 
 fn main() {
     let Some(instance)=shell::single_instance().expect("无法建立轻笺单实例") else{return};
-    let data_root=data_root::resolve().expect("无法定位轻笺数据目录");
+    let base_root=data_root::resolve().expect("无法定位轻笺数据目录");
+    // 账号工作区在创建数据库与 WebView 前选定，切换必须重启，避免旧缓存串号。
+    let (cloud_state,data_root)=cloud::initialize(&base_root).expect("无法定位账号工作区");
     // 将本进程及其子进程可控制的临时文件也引导到选定的数据根目录。
     let temp=data_root.join("temp");
     std::fs::create_dir_all(&temp).expect("无法创建轻笺临时目录");
@@ -127,8 +131,9 @@ fn main() {
     std::env::set_var("TMP",&temp);
     tauri::Builder::default()
         .manage(instance)
+        .manage(cloud_state)
         .manage(Mutex::new(QuickState::default()))
-        .invoke_handler(tauri::generate_handler![auto_backup::test_auto_backup_tick,auto_backup::backup_preferences,auto_backup::auto_backup_status,auto_backup::configure_auto_backup,auto_backup::backup_now,auto_backup::open_backup_folder,document_export::choose_export_folder,document_export::export_documents,document_import::choose_document_files,document_import::preview_documents,document_import::remap_document_json,document_import::cancel_document_import,document_import::commit_documents,news_collect::collect_news,window_native::begin_grip_drag,shell::toggle_shell_maximize,shell::set_background_transparency,delete_recording,list_recording_headers,get_recording,retry_audio_segment,reset_transcription_job,save_recording_text,play_recording_at,pause_recording,get_model_news,refresh_model_news,model_news_task_status,cancel_model_news,task_status,preview_audio_inputs,audio_devices,get_recording_inputs,save_recording_inputs,transcribe_recording,set_recording_route,save_recording_audio,open_recording_folder,discard_recording_audio,install_sensevoice,online_config,save_online_config,test_online_model,online_test_status,cancel_online_test,process_online,audio_config,save_audio_config,choose_audio_path,start_recording,stop_recording,recording_status,list_recordings,play_recording,stop_playback,transcribe_local,check_local_model,get_shell_settings,set_shell_setting,set_shell_busy,get_shell_diagnostics,reveal_shell,get_news_cache,get_news_update_status,refresh_news,open_news_link,quick_window::set_quick_menu_size,quick_window::set_quick_compact_width,quick_window::set_quick_hover_width,get_quick_side, set_quick_expanded, set_quick_content_count, set_quick_content_height, set_quick_drag_active, list_items, list_trashed, save_item, get_item, list_pins, pin_item, unpin_item, trash_item, restore_item, delete_item_forever, set_item_pinned, move_item, list_reminders, save_reminder, cancel_reminder, complete_reminder, completed_reminder_count, complete_quick_drag, finish_leave,apply_backup_media,backup_entries,choose_backup_path,export_backup,preview_backup,import_backup,get_holidays,refresh_holidays,get_free_api_cache,refresh_free_api,apply_backup_window])
+        .invoke_handler(tauri::generate_handler![cloud::cloud_status,cloud::cloud_configure,cloud::cloud_send_code,cloud::cloud_verify,cloud::cloud_logout,cloud::cloud_restart,cloud::cloud_link_local,cloud::cloud_sync,cloud::cloud_resolve_conflict,auto_backup::test_auto_backup_tick,auto_backup::backup_preferences,auto_backup::auto_backup_status,auto_backup::configure_auto_backup,auto_backup::backup_now,auto_backup::open_backup_folder,document_export::choose_export_folder,document_export::export_documents,document_import::choose_document_files,document_import::preview_documents,document_import::remap_document_json,document_import::cancel_document_import,document_import::commit_documents,news_collect::collect_news,window_native::begin_grip_drag,shell::toggle_shell_maximize,shell::set_background_transparency,delete_recording,list_recording_headers,get_recording,retry_audio_segment,reset_transcription_job,save_recording_text,play_recording_at,pause_recording,get_model_news,refresh_model_news,model_news_task_status,cancel_model_news,task_status,preview_audio_inputs,audio_devices,get_recording_inputs,save_recording_inputs,transcribe_recording,set_recording_route,save_recording_audio,open_recording_folder,discard_recording_audio,install_sensevoice,online_config,save_online_config,test_online_model,online_test_status,cancel_online_test,process_online,audio_config,save_audio_config,choose_audio_path,start_recording,stop_recording,recording_status,list_recordings,play_recording,stop_playback,transcribe_local,check_local_model,get_shell_settings,set_shell_setting,set_shell_busy,get_shell_diagnostics,reveal_shell,get_news_cache,get_news_update_status,refresh_news,open_news_link,quick_window::set_quick_menu_size,quick_window::set_quick_compact_width,quick_window::set_quick_hover_width,get_quick_side, set_quick_expanded, set_quick_content_count, set_quick_content_height, set_quick_drag_active, list_items, list_trashed, save_item, get_item, list_pins, pin_item, unpin_item, trash_item, restore_item, delete_item_forever, set_item_pinned, move_item, list_reminders, save_reminder, cancel_reminder, complete_reminder, completed_reminder_count, complete_quick_drag, finish_leave,apply_backup_media,backup_entries,choose_backup_path,export_backup,preview_backup,import_backup,get_holidays,refresh_holidays,get_free_api_cache,refresh_free_api,apply_backup_window])
         .setup(move |app| {
             let main=tauri::WebviewWindowBuilder::new(app,"main",tauri::WebviewUrl::App("index.html".into()))
                 .title("轻笺 V1").inner_size(327.0,720.0).min_inner_size(326.0,480.0)
@@ -137,6 +142,7 @@ fn main() {
             let _=main;
             app.manage(data_root::DataRoot(data_root.clone()));
             let (database, path) = database::open(&data_root).map_err(std::io::Error::other)?;
+            if data_root!=base_root {sync_store::install(&*database.0.lock().map_err(|_|std::io::Error::other("数据库不可用"))?).map_err(std::io::Error::other)?;}
             app.manage(database);
             recording_delete::recover_pending(app.handle()).map_err(std::io::Error::other)?;
             recording_capture::recover_sessions(app.handle()).map_err(std::io::Error::other)?;
@@ -144,6 +150,7 @@ fn main() {
             create_quick(app)?;
             shell::initialize(app.handle()).map_err(std::io::Error::other)?;
             auto_backup::start(app.handle().clone());
+            cloud::start(app.handle().clone());
             news::start_background(app.handle().clone());
             show_main(app.handle());
             model_news::start_background(app.handle().clone());
