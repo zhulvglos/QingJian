@@ -55,6 +55,8 @@ pub fn initialize(root:&Path)->Result<(Cloud,PathBuf),String>{
     let cloud=Cloud{root:root.to_path_buf(),config:Mutex::new(config),account,gate:Mutex::new(None),progress:Mutex::new(Progress::default()),stopped:AtomicBool::new(false),cancel_sync:AtomicBool::new(false)};
     Ok((cloud,effective))
 }
+// 只向本机资源检测提供基础目录，不暴露会话或其他账号数据。
+pub fn local_base_root(cloud:&Cloud)->&Path { &cloud.root }
 fn email(value:&str)->Result<String,String>{
     let s=value.trim();
     if s.len()>254||!regex::Regex::new(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$").unwrap().is_match(s){return Err("请输入有效邮箱地址，例如 123456@qq.com".into());}Ok(s.into())

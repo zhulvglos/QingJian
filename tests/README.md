@@ -1,5 +1,7 @@
 # 云同步验收脚本
 
+`native_voice_reuse.mjs` 验证登录工作区的本机语音资源复用。使用全新 D 盘隔离目录 `QJ_TEST_ROOT`、构建程序 `QJ_TEST_EXE`、本机 Python `QJ_TEST_PYTHON`、已有语音资源根目录 `QJ_VOICE_RESOURCES_ROOT`，可选 `QJ_TEST_PORT`。仅创建合成配置和账号标记，不复制正式数据库；真实模型只供内置样例转写。测试还会在测试子进程不可达代理下调用一键安装入口，确认已有完整资源不重复下载。
+
 `native_cloud.mjs` 使用 `QJ_TEST_ROOT`、`QJ_TEST_EXE`、可选 `QJ_TEST_PORT`，要求 D 盘全新隔离目录（路径包含 `isolated-test`）。它验证本地原生流程与账号缓存隔离，不表示真实认证成功。
 
 `start_live_cloud.mjs a` / `b` 启动两个隔离客户端，默认使用维护者 D 盘构建路径和测试目录，迁移环境时需调整路径。新建客户端拒绝覆盖已有数据库；`--resume` 仅恢复已有测试库；`--offline` 仅改变测试子进程代理。不要连接正式工作区或真实笔记。

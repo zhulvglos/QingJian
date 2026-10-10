@@ -3,6 +3,7 @@ mod window_native;
 mod native_dialog;
 
 mod sensevoice;
+mod voice_reuse;
 mod sensevoice_env;
 mod recording_flow;
 mod sensevoice_install;

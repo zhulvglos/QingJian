@@ -2,7 +2,7 @@ import {useEffect,useState,useRef} from 'react';
 import {useRunState} from './run_session';
 import {invoke} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
-type Config={root:string;engine?:'sensevoice';sensePython?:string;senseRuntime?:string;senseModels?:string;available:boolean;processing?:boolean;installation?:{state?:string;error?:string};validation?:{transcribed?:boolean;integrity?:boolean}};
+type Config={root:string;engine?:'sensevoice';sensePython?:string;senseRuntime?:string;senseModels?:string;available:boolean;reusedLocalResources?:boolean;processing?:boolean;installation?:{state?:string;error?:string};validation?:{transcribed?:boolean;integrity?:boolean}};
 export function VoiceSettings(){return <section className="model-settings"><h1>语音</h1><LocalVoiceSettings/><OnlineEditor kind="audio"/></section>;}
 function LocalVoiceSettings(){
  const [config,setConfig]=useRunState<Config>('voice.config',{root:'',available:false}),[busy,setBusy]=useRunState('voice.busy',false),[dirty,setDirty]=useRunState('voice.dirty',false),[error,setError]=useRunState('voice.error',''),[progress,setProgress]=useRunState('voice.progress','');
@@ -22,6 +22,8 @@ function LocalVoiceSettings(){
   <details className="local-paths"><summary>模型与保存位置</summary>{fields.map(k=><label key={k}>{names[k]}<input value={config[k]||''} onChange={e=>change(k,e.target.value)}/><button onClick={()=>void run(async()=>{const path=await invoke<string|null>('choose_audio_path',{kind:k});if(path)change(k,path);else setProgress('');})}>选择</button></label>)}</details>
   <div className="file-actions"><button onClick={()=>void run(async()=>{let c=config;if(!c.root){const path=await invoke<string|null>('choose_audio_path',{kind:'root'});if(!path){setProgress('');return;}c={...c,root:path};}await invoke('save_audio_config',{config:c});setProgress('安装中…');setConfig(await invoke<Config>('install_sensevoice'));setDirty(false);setProgress('');})}>一键检测并安装</button><button onClick={()=>void run(async()=>{setConfig(await invoke<Config>('save_audio_config',{config}));setDirty(false);setProgress('配置已保存');})}>保存</button><button disabled={dirty||!config.available} onClick={()=>void run(async()=>{setProgress('检查并转写样例…');await invoke<string>('check_local_model');setConfig(await invoke<Config>('audio_config'));setProgress('');})}>检查可用性</button></div>
  </fieldset>
+ {config.reusedLocalResources&&<p>已复用本机已有 SenseVoice，无需重复下载。录音仍保存在当前工作区。</p>}
+ {!config.available&&!busy&&!dirty&&<p>当前路径未找到完整语音资源。请核对模型目录、已有运行环境和兼容运行程序；保存配置不会下载文件。</p>}
  <p role="status">{busy||config.processing?progress||(config.installation?.state==='installing'?'安装中…':'检查中…'):dirty?'配置已修改，请先保存':config.validation?.transcribed?'可用 · 实际转写通过':error||config.installation?.state==='repair'?'需修复':config.available?'需检查':'未安装'}</p>
  {!busy&&progress&&<p>{progress}</p>}{error&&<><p role="alert" className="error-text">检查或配置失败</p><details className="model-error"><summary>查看原因</summary><p>{error}</p></details></>}
  </section>;

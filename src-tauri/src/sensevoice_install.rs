@@ -33,10 +33,16 @@ fn resources(root:&Path)->Result<(),String>{
     let w:Vec<u16>=root.as_os_str().encode_wide().chain(Some(0)).collect();let(mut avail,mut total,mut free)=(0,0,0);if unsafe{GetDiskFreeSpaceExW(w.as_ptr(),&mut avail,&mut total,&mut free)}==0{return Err("无法检测磁盘空间".into());}if avail<4_000_000_000{return Err("安装目录至少需要 4 GB 可用空间".into());}Ok(())
 }
 fn install(app:&tauri::AppHandle)->Result<Value,String>{
-    let mut c=audio::audio_config(app.clone())?;let root=PathBuf::from(c["root"].as_str().unwrap_or(""));non_c(&root)?;fs::create_dir_all(&root).map_err(err)?;stage(app,"检查 Windows 架构、内存与磁盘…");resources(&root)?;
+    let mut c=audio::audio_config(app.clone())?;let root=PathBuf::from(c["root"].as_str().unwrap_or(""));non_c(&root)?;fs::create_dir_all(&root).map_err(err)?;
+    // 已有完整资源直接实际转写验证；失败也不自动重新下载或覆盖用户模型。
+    if crate::sensevoice::available(&c){
+        stage(app,"检查本机已有 SenseVoice，不重复下载…");
+        audio::check_sync(app.clone()).map_err(|e|format!("本机已有语音资源未通过实际转写检查，未重新下载：{e}"))?;
+        return audio::audio_config(app.clone());
+    }
+    stage(app,"检查 Windows 架构、内存与磁盘…");resources(&root)?;
     // 仅认可用户保存的路径；自定义资源不可用时报告错误，不改写其配置或目录。
     crate::sensevoice_env::audit(&root,"install-start",json!({"python":c["sensePython"],"runtime":c["senseRuntime"],"models":c["senseModels"],"root":root,"automaticExternalDiscovery":false}))?;
-    if crate::sensevoice::available(&c){stage(app,"检查已配置 SenseVoice…");if audio::check_sync(app.clone()).is_ok(){return audio::audio_config(app.clone());}}
     if has_custom_paths(&c,&root){return Err("已保存的自定义语音资源未通过检查；原配置与文件已保留，请检查所选路径".into());}
     let owned=root.join("sensevoice");fs::create_dir_all(&owned).map_err(err)?;
     let models=owned.join("models");
